@@ -1,0 +1,10 @@
+# dataset + trained weights
+data/
+*.pt
+
+# python
+__pycache__/
+*.pyc
+
+# uv / venv
+.venv/
