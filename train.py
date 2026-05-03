@@ -1,40 +1,33 @@
 import torch
-import torch.nn.functional as F
 
-from data import loaders
+import config as C
+from data import get_loaders
 from log import log
+from metrics import LOSSES
 from model import MLP
 from schedule import cosine, current_lr
-
-# Hyperparameters - edit these to tweak training.
-EPOCHS = 5
-LR = 1e-3                          # initial (max) learning rate
-CKPT = "model.pt"                  # where trained weights get saved
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+from snapshots import Recorder
 
 
-def train_epoch(model, loader, opt, sched):
-    # Run one full pass over the training set and return the average loss
-    # and accuracy *measured on the training data itself*. These numbers
-    # show how well the model is fitting what it has seen - they are NOT a
-    # measure of generalization (use eval.py for that).
+def train_epoch(model, loader, opt, sched, recorder, loss_fn):
+    # Run one full pass over the training set. Returns mean loss + accuracy
+    # measured on the training data (NOT a measure of generalization).
+    # The recorder snapshots (x_k, u_k) every C.SNAP_EVERY steps.
     model.train()
-    total_loss = 0.0   # sum of per-sample losses
-    correct = 0        # count of correctly predicted samples
-    total = 0          # total samples seen this epoch
+    total_loss, correct, total = 0.0, 0, 0
 
     for x, y in loader:
-        x, y = x.to(DEVICE), y.to(DEVICE)
+        x, y = x.to(C.DEVICE), y.to(C.DEVICE)
 
         opt.zero_grad()                          # clear last step's gradients
         logits = model(x)                        # forward pass, raw scores
-        loss = F.cross_entropy(logits, y)        # softmax + NLL in one call
+        loss = loss_fn(logits, y)                # configurable loss (config.LOSS)
         loss.backward()                          # back-prop gradients
         opt.step()                               # update weights
-        sched.step()                             # advance LR schedule one step
+        sched.step()                             # advance LR schedule
 
-        # Accumulate stats. Multiply by batch size so we can divide by the
-        # true sample count at the end (last batch may be smaller).
+        recorder.step(model, opt)                # capture (x_k, u_k) if due
+
         total_loss += loss.item() * y.size(0)
         correct    += (logits.argmax(dim=1) == y).sum().item()
         total      += y.size(0)
@@ -43,37 +36,41 @@ def train_epoch(model, loader, opt, sched):
 
 
 def main():
-    # 1. Load data. MNIST's built-in train/test split is disjoint, so the
-    #    test set stays untouched here - we only train on the train split.
-    train_loader, _ = loaders()
+    # 1. Load the chosen dataset. MNIST/FashionMNIST/CIFAR-10 ship a fixed
+    #    train/test split - the test set stays untouched during training.
+    train_loader, _ = get_loaders(C.DATASET, C.BATCH_SIZE, C.EVAL_BATCH, C.DATA_ROOT)
 
-    # 2. Build model + optimizer + LR scheduler.
-    model = MLP().to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
-    # Cosine schedule needs to know the total number of optimizer steps
-    # across the whole run. We step per batch, so total = epochs * batches.
-    total_steps = EPOCHS * len(train_loader)
-    sched = cosine(opt, total_steps)
+    # 2. Build model, optimizer, LR scheduler, loss function.
+    model   = MLP(C.ARCH).to(C.DEVICE)
+    opt     = torch.optim.Adam(model.parameters(), lr=C.LR)
+    sched   = cosine(opt, C.EPOCHS * len(train_loader))
+    loss_fn = LOSSES[C.LOSS]
 
-    log("info", f"device={DEVICE}  epochs={EPOCHS}  lr={LR}  schedule=cosine")
+    # 3. Snapshot recorder. The control variable u_k is whatever
+    #    config.control_fn returns - default is the scalar learning rate.
+    recorder = Recorder(every=C.SNAP_EVERY, control_fn=C.control_fn)
 
-    # 3. Train. Each line shows progress on the *training* data:
-    #      train_loss - average cross-entropy loss this epoch
-    #      train_acc  - fraction of training samples predicted correctly
-    #      lr         - learning rate at the end of the epoch (decaying)
-    for epoch in range(1, EPOCHS + 1):
-        train_loss, train_acc = train_epoch(model, train_loader, opt, sched)
-        log(
-            "ok",
-            f"epoch {epoch}/{EPOCHS}  "
-            f"train_loss={train_loss:.4f}  "
-            f"train_acc={train_acc*100:.2f}%  "
-            f"lr={current_lr(opt):.2e}",
-        )
+    log("info",
+        f"dataset={C.DATASET}  arch={C.ARCH}  device={C.DEVICE}  "
+        f"epochs={C.EPOCHS}  lr={C.LR}  loss={C.LOSS}  snap_every={C.SNAP_EVERY}")
 
-    # 4. Save weights so eval.py can load and test on the held-out set.
-    torch.save(model.state_dict(), CKPT)
-    log("info", f"saved weights to {CKPT}  (run eval.py to test)")
+    # 4. Train. Each line shows train loss, train accuracy, and current lr.
+    for epoch in range(1, C.EPOCHS + 1):
+        loss_v, acc_v = train_epoch(model, train_loader, opt, sched, recorder, loss_fn)
+        log("ok",
+            f"epoch {epoch}/{C.EPOCHS}  "
+            f"train_loss={loss_v:.4f}  "
+            f"train_acc={acc_v*100:.2f}%  "
+            f"lr={current_lr(opt):.2e}")
+
+    # 5. Persist artefacts. eval.py + plot.py read these.
+    torch.save(model.state_dict(), C.CKPT_PATH)
+    log("info", f"saved weights to {C.CKPT_PATH}")
+
+    recorder.save(C.SNAP_PATH)
+    log("info",
+        f"saved {len(recorder.X)} snapshots to {C.SNAP_PATH}  "
+        f"(run plot.py and eval.py for DMDc analysis)")
 
 
 if __name__ == "__main__":

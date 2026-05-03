@@ -1,6 +1,14 @@
-# dataset + trained weights
+# dataset + trained weights + DMDc artefacts (anything generated)
 data/
 *.pt
+*.npz
+*.npy
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+*.csv
 
 # python
 __pycache__/

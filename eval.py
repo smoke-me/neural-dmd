@@ -1,45 +1,67 @@
+"""
+Evaluation script. Two outputs:
+
+  1. Trained-model report: the configurable METRIC (default: classification
+     accuracy) of the saved checkpoint on the held-out test set.
+
+  2. DMDc parameter-prediction-accuracy plot. Implements
+                e(k) = ||x_hat_k - x_k||_2 / ||x_k||_2
+     and plots accuracy = 100 * (1 - e(k)) against training step. The
+     "actual" reference is trivially 100% (a vector compared against
+     itself). The "DMDc" curve sits at 100% inside the fit region (where
+     x_hat_k matches x_k by construction) and drops in the forecast region
+     as the linear model extrapolates. Saved to config.ACC_PLOT.
+"""
+
+import numpy as np
 import torch
 
-from data import loaders
+import config as C
+from analysis import fit_and_forecast, load_snapshots
+from data import get_loaders
+from figures import comparison_plot
 from log import log
+from metrics import METRICS, metric_at
 from model import MLP
-
-# Where to load the trained weights from. Written by train.py.
-CKPT = "model.pt"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-@torch.no_grad()  # disable gradient tracking - saves memory + time
-def evaluate(model, loader, device):
-    # Compute classification accuracy on the given loader. Lives here so
-    # train.py and any other consumer share one definition.
-    model.eval()  # turn off dropout/batchnorm-train behaviour
-    correct = 0
-    total = 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        pred = model(x).argmax(dim=1)            # predicted class = argmax logit
-        correct += (pred == y).sum().item()
-        total += y.size(0)
-    return correct, total
+from params import flatten_params
 
 
 def main():
-    # MNIST ships with a fixed 60k/10k train/test split - the test set
-    # never overlaps training. We only touch the test loader here.
-    _, test_loader = loaders()
-    log("info", f"loading {CKPT} on {DEVICE}")
+    _, test_loader = get_loaders(C.DATASET, C.BATCH_SIZE, C.EVAL_BATCH, C.DATA_ROOT)
+    metric_fn = METRICS[C.METRIC]
 
-    # Rebuild the same architecture, then load the saved weights into it.
-    model = MLP().to(DEVICE)
-    model.load_state_dict(torch.load(CKPT, map_location=DEVICE))
+    # --- 1. Trained-model evaluation on the held-out test set. ---
+    log("info", f"loading {C.CKPT_PATH} on {C.DEVICE}")
+    net = MLP(C.ARCH).to(C.DEVICE)
+    net.load_state_dict(torch.load(C.CKPT_PATH, map_location=C.DEVICE))
 
-    # Run the held-out test set and report:
-    #   test_acc - fraction of unseen samples predicted correctly
-    #              (this is the honest measure of generalization)
-    correct, total = evaluate(model, test_loader, DEVICE)
-    acc = correct / total
-    log("ok", f"test_acc={acc*100:.2f}%  ({correct}/{total} correct)")
+    score = metric_at(net, flatten_params(net), test_loader, C.DEVICE, metric_fn)
+    log("ok", f"trained-model {C.METRIC} = {score*100:.2f}%")
+
+    # --- 2. DMDc parameter-prediction-accuracy plot. ---
+    X, U, steps = load_snapshots(C.SNAP_PATH)
+    m = X.shape[1]
+    log("info", f"loaded {C.SNAP_PATH}  X={X.shape}  U={U.shape}  m={m} snapshots")
+
+    X_pred, split, mdl = fit_and_forecast(X, U, C.FIT_FRAC, C.RANK)
+    log("ok", f"DMDc fit on first {split}/{m} snapshots, rank={mdl['rank']}")
+
+    # e(k) = ||x_hat_k - x_k|| / ||x_k||  -> prediction accuracy = 100*(1 - e).
+    e = np.linalg.norm(X_pred - X, axis=0) / (np.linalg.norm(X, axis=0) + 1e-12)
+    acc_pred   = 100.0 * (1.0 - e)
+    acc_actual = np.full(m, 100.0)               # a vector vs itself: 0 error
+
+    comparison_plot(
+        steps, acc_actual, acc_pred, split,
+        out_path=C.ACC_PLOT,
+        title=f"DMDc parameter prediction accuracy on {C.DATASET.upper()}   "
+              f"·   fit on first {split}/{m} snapshots   ·   rank {mdl['rank']}",
+        ylabel="prediction accuracy  [%]",
+        actual_label=r"actual  $x_k$  (reference, 100%)",
+        pred_label=r"DMDc   $100\cdot(1 - \|\hat{x}_k - x_k\|/\|x_k\|)$",
+        summary_label="mean |Δaccuracy|   in-sample = {in_:.4f}%    out-of-sample = {out:.4f}%",
+    )
+    log("ok", f"saved figure to {C.ACC_PLOT}")
 
 
 if __name__ == "__main__":

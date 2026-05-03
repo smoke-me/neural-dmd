@@ -1,23 +1,22 @@
 import torch.nn as nn
 
 
-# Plain feed-forward network (multi-layer perceptron).
-# Input  : 28x28 MNIST image, flattened to 784 values
-# Hidden : 128 then 64 neurons, both with ReLU activation
-# Output : 10 logits, one per digit class (0-9)
 class MLP(nn.Module):
-    def __init__(self):
+    # Feed-forward network with arbitrary layer widths.
+    #
+    # `sizes` is a list of layer sizes, e.g. [784, 128, 64, 10] gives
+    # 784 -> 128 -> 64 -> 10 with ReLU between hidden layers and raw
+    # logits at the output. Adjust `sizes[0]` to match the flattened
+    # input dimension and `sizes[-1]` to match the number of classes
+    # whenever you change dataset.
+    def __init__(self, sizes):
         super().__init__()
-        # Sequential chains layers in order. Each input flows top to bottom.
-        self.net = nn.Sequential(
-            nn.Flatten(),          # (B, 1, 28, 28) -> (B, 784)
-            nn.Linear(784, 128),   # fully connected layer
-            nn.ReLU(),             # non-linearity
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 10),     # raw logits; softmax handled in the loss
-        )
+        layers = [nn.Flatten()]
+        for i in range(len(sizes) - 1):
+            layers.append(nn.Linear(sizes[i], sizes[i + 1]))
+            if i < len(sizes) - 2:           # no activation after last layer
+                layers.append(nn.ReLU())
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
-        # Called automatically when you do `model(x)`.
         return self.net(x)

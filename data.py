@@ -1,24 +1,43 @@
+"""
+Pluggable image-classification dataset loader.
+
+To add a new dataset:
+  1. Build a (torchvision Dataset class, transform) pair below.
+  2. Register it in DATASETS under any short name.
+  3. Set config.DATASET to that name. Update config.ARCH so the first
+     layer matches the flattened input dim and the last matches #classes.
+"""
+
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-# Pre-processing applied to each MNIST image:
-#   1. ToTensor      - convert PIL image (0-255) to float tensor (0-1)
-#   2. Normalize     - shift/scale so pixel values have ~zero mean, unit std.
-#                      0.1307 and 0.3081 are the known mean/std of MNIST.
-transform = transforms.Compose([
+# Standard normalisations. Mean/std are dataset-specific.
+_mnist_tx = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize((0.1307,), (0.3081,)),
 ])
 
+_cifar_tx = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465),
+                         (0.2470, 0.2435, 0.2616)),
+])
 
-def loaders(batch_size=64, root="./data"):
-    # Build train and test DataLoaders.
-    # `download=True` fetches MNIST into `root` on first run, then reuses it.
-    train = datasets.MNIST(root, train=True,  download=True, transform=transform)
-    test  = datasets.MNIST(root, train=False, download=True, transform=transform)
+# Registry: name -> (Dataset class, transform).
+DATASETS = {
+    "mnist":         (datasets.MNIST,        _mnist_tx),
+    "fashion_mnist": (datasets.FashionMNIST, _mnist_tx),
+    "cifar10":       (datasets.CIFAR10,      _cifar_tx),
+}
+
+
+def get_loaders(name: str, batch_size: int, eval_batch: int, root: str):
+    # Look up the Dataset class + transform for the chosen name and build
+    # train / test DataLoaders. First call downloads the data into `root`.
+    DS, tx = DATASETS[name]
+    train = DS(root, train=True,  download=True, transform=tx)
+    test  = DS(root, train=False, download=True, transform=tx)
     return (
-        # shuffle=True so the model sees batches in random order each epoch.
         DataLoader(train, batch_size=batch_size, shuffle=True),
-        # Bigger batch for eval is fine; no gradients tracked there.
-        DataLoader(test,  batch_size=1000),
+        DataLoader(test,  batch_size=eval_batch),
     )
