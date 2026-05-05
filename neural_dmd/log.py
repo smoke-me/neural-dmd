@@ -48,3 +48,34 @@ def progress(label: str, current: int, total: int, t_start: float, *,
     log("info",
         f"  {label}: {current}/{total} ({pct:5.1f}%)  "
         f"elapsed={elapsed:6.1f}s  eta={eta:6.1f}s")
+
+
+def log_spectrum(label, sigma, top_n: int = 5):
+    # Pretty-print a singular-value spectrum: top-N values, the ranks
+    # required to capture 90 / 99 / 99.9% of cumulative L2 energy
+    # (sum sigma_i^2), and the condition number sigma_0 / sigma_min.
+    # Used by dmdc / optdmdc / coptdmdc kernels so the user can see how
+    # sharply the trajectory's variance is concentrated in the top modes
+    # (-> how lossy a low-rank truncation will be).
+    import numpy as np  # noqa: WPS433  (deferred import to keep log.py stdlib-only otherwise)
+    s = np.asarray(sigma, dtype=float)
+    n = len(s)
+    energy = s ** 2
+    total  = energy.sum()
+    if total <= 0.0:
+        log("info", f"{label}: empty spectrum")
+        return
+    cum = np.cumsum(energy) / total
+    def rank_for(thr):
+        return int(np.searchsorted(cum, thr) + 1)
+    k90  = rank_for(0.90)
+    k99  = rank_for(0.99)
+    k999 = rank_for(0.999)
+    head = "  ".join(f"sigma_{i}={s[i]:.3e}" for i in range(min(top_n, n)))
+    cond = s[0] / s[-1] if s[-1] > 0 else float("inf")
+    log("info",
+        f"{label}: n={n}  {head}  sigma_min={s[-1]:.3e}  "
+        f"cond={cond:.2e}")
+    log("info",
+        f"{label}: rank for  90%={k90}  99%={k99}  99.9%={k999}  "
+        f"100%={n}")

@@ -1,237 +1,503 @@
 # neural-dmd
 
-Train an MLP on MNIST, record its parameter trajectory during training, fit
-a Dynamic Mode Decomposition with control (DMDc) linear model to that
-trajectory, and measure the linear model's ability to forecast the trained
-network's behavior over portions of the training run not used for fitting.
+Train an MLP on a classification dataset, record its parameter
+trajectory during training, fit a family of DMDc-style linear models to
+that trajectory, and measure how well each model forecasts the trained
+network's behaviour over portions of the training run not used for
+fitting.
 
-The full configuration lives in `neural_dmd/config.py`. All swappable
-components (dataset, model architecture, loss, evaluation metric, control
-input, snapshot cadences, DMDc rank, fit/forecast split) are exposed there
-as single-line edits.
+Four methods are implemented:
 
-## Method
+| Method     | Idea                                                         |
+|------------|--------------------------------------------------------------|
+| `dmdc`     | Plain DMDc (Proctor-Brunton-Kutz, 2016) - SVD-based linear LSQ. |
+| `sdmdc`    | DMDc + post-hoc radial-projection clipping of unstable eigenvalues. No optimisation. |
+| `optdmdc`  | Optimized DMD with control (Askham-Kutz variable projection extended with exogeneous inputs). LM, no constraint. |
+| `coptdmdc` | Constrained Optimized DMDc (Rains et al., JCP 2024). LM with `Re(γ) ≤ 0` enforced. |
 
-### Parameterization
+Each method shares the same warm-start kernel and the same forecast
+loop, so the differences between them are isolated to a small number
+of well-marked stages.
 
-The network's weights and biases are flattened into a single state vector
-$x \in \mathbb{R}^n$, where $n$ is the total parameter count. For the default
-architecture (`config.ARCH = [784, 128, 64, 10]`), $n = 109{,}386$. Each
-gradient update produces a new state vector, so a training run of $T$ steps
-yields a trajectory $x_0, x_1, \dots, x_T$. The learning rate at step $k$,
-denoted $u_k$, is treated as a scalar control input; the default schedule
-is cosine annealing.
+---
 
-### Snapshot capture
+## Quick start
 
-The training run is partitioned into a *fit region* $[0, T_\mathrm{fit})$
-and a *forecast region* $[T_\mathrm{fit}, T)$ by `config.FIT_FRAC`. Within
-each region the recorder samples the parameter trajectory at an independent
-cadence (`config.SNAP_FIT_EVERY` and `config.SNAP_FORECAST_EVERY`). The
-fit-region samples form the dataset DMDc fits its linear model to; the
-forecast-region samples serve as ground-truth comparison points for the
-predicted trajectory. The control sequence $u_k$ is recorded at every
-gradient step regardless of snapshot cadence, since the forecast iteration
-requires a control value at each step it advances through.
+```bash
+# 1. install dependencies
+uv venv
+uv pip install -r requirements.txt
 
-### DMDc fit
-
-DMDc estimates matrices $A$ and $B$ satisfying
-
-$$x_{k+1} \approx A\,x_k + B\,u_k$$
-
-from the fit-region snapshots. The full operator $A \in \mathbb{R}^{n \times n}$
-is never formed. Instead, the algorithm of Proctor, Brunton, and Kutz
-(SIAM J. Appl. Dyn. Syst., 2016) projects the dynamics onto a
-low-dimensional POD basis derived from the snapshot data, with reduced
-dimension at most $\min(n, m_\mathrm{fit})$, where $m_\mathrm{fit}$ is the
-number of fit-region snapshots. The SVD runs in `float64` internally so
-that singular values close to machine precision are resolved without
-loss of orthogonality; the predicted trajectory is cast back to `float32`
-on output to match the snapshot file schema.
-
-### Forecast and evaluation
-
-Once $(A, B)$ are fit, the linear rule is iterated forward from the final
-fit-region snapshot, applying the recorded control sequence step by step,
-to produce a predicted trajectory $\hat{x}_k$ over the forecast region.
-Three figures and one stdout report compare the prediction to ground truth:
-
-1. `dmdc_loss.png` overlays the test-set loss $\mathcal{L}(x_k; \mathcal{D})$
-   against $\mathcal{L}(\hat{x}_k; \mathcal{D})$ across the trajectory.
-2. `dmdc_accuracy.png` plots the parameter-prediction accuracy
-   $100\,(1 - \|\hat{x}_k - x_k\|_2 / \|x_k\|_2)\,\%$.
-3. `dmdc_eigenvalues.png` shows the eigenvalues of the reduced operator
-   $A$ in the complex plane against the unit circle, which is the
-   stability boundary for a discrete-time linear system.
-4. `scripts/test.py` reports the trained model's chosen metric (default:
-   classification accuracy) on the held-out test set.
-
-## Default configuration
-
-| Parameter                       | Value                                              |
-|---------------------------------|----------------------------------------------------|
-| Dataset                         | MNIST (60,000 train / 10,000 test)                 |
-| Batch size                      | 100                                                |
-| Epochs                          | 5                                                  |
-| Total gradient steps            | 3,000                                              |
-| Architecture                    | MLP 784 → 128 → 64 → 10                            |
-| Parameter count $n$             | 109,386                                            |
-| Learning rate schedule          | Cosine annealing, $\eta_0 = 10^{-3}$, $\eta_\min = 0$ |
-| Loss                            | Cross-entropy                                      |
-| Fit / forecast split            | 1,500 / 1,500 gradient steps                       |
-| `SNAP_FIT_EVERY`                | 1                                                  |
-| `SNAP_FORECAST_EVERY`           | 50                                                 |
-| Fit-region snapshots            | 1,500                                              |
-| Forecast-region snapshots       | 30                                                 |
-| DMDc rank                       | Full available, $\min(n, m_\mathrm{fit}) = 1{,}500$ |
-| `outputs/snapshots.npz` size    | ≈ 640 MB                                           |
-
-## Project layout
-
-```
-neural-dmd/
-├── README.md
-├── requirements.txt
-├── neural_dmd/                  # library (importable package)
-│   ├── __init__.py
-│   ├── config.py
-│   ├── data.py
-│   ├── dmdc.py
-│   ├── figures.py
-│   ├── log.py
-│   ├── metrics.py
-│   ├── model.py
-│   ├── params.py
-│   ├── schedule.py
-│   └── snapshots.py
-├── scripts/                     # runnable entry points
-│   ├── train.py
-│   ├── analyze.py
-│   ├── test.py
-│   ├── plot_loss.py
-│   ├── plot_accuracy.py
-│   └── plot_eigenvalues.py
-├── data/                        # downloaded dataset cache
-└── outputs/                     # generated artifacts (created automatically)
-    ├── model.pt
-    ├── snapshots.npz
-    ├── analysis.npz
-    └── plots/
-        ├── dmdc_loss.png
-        ├── dmdc_accuracy.png
-        └── dmdc_eigenvalues.png
+# 2. run the full pipeline (train if needed + every method in
+#    config.METHODS + plots + summary.html)
+python scripts/run_exp.py
 ```
 
-Library modules contain no `__main__`; all runnable code lives in
-`scripts/`. Each script begins with a short bootstrap that adds the project
-root to `sys.path`, allowing direct invocation (`python scripts/X.py`) from
-any working directory. All output paths in `config.py` are anchored to the
-project root.
+Open `outputs/experiments/<exp_id>/summary.html` for the result. The
+summary embeds the metrics table, eigenvalue diagnostics, and links
+to every plot.
 
-## Module reference
+---
 
-| Module | Responsibility |
-|---|---|
-| `config.py`              | Centralized configuration: hyperparameters, snapshot cadences, file paths, and the `control_fn(optimizer, step)` callback producing the DMDc control input. |
-| `data.py`                | Dataset registry (`DATASETS`) and DataLoader factory (`get_loaders`). MNIST, Fashion-MNIST, and CIFAR-10 are pre-registered. |
-| `model.py`               | MLP parameterized by a list of layer widths. |
-| `schedule.py`            | Cosine annealing scheduler used during training, plus a closed-form `cosine_lr_at(step, total_steps, lr_max, min_lr)`. |
-| `metrics.py`             | `LOSSES` and `METRICS` registries; `loss_at` / `metric_at` evaluate a parameter vector against a DataLoader. |
-| `params.py`              | Bidirectional conversion between the network's named parameter tensors and a single flat NumPy vector. |
-| `snapshots.py`           | Dual-cadence `Recorder`, its on-disk schema (`save`, `load`), and `eval_indices(steps, every)` for subsampling. |
-| `dmdc.py`                | DMDc fit and forecast in NumPy. Returns the reduced operator $A$, the modes, and the predicted trajectory. |
-| `figures.py`             | Two matplotlib helpers: `comparison_plot` (loss / accuracy curves) and `eigenvalue_plot`. |
-| `log.py`                 | ANSI-colored console logger with `INFO` / `OK` / `WARN` / `ERR` tags, plus `banner` and `progress` helpers. |
-| `scripts/train.py`       | Trains the model; writes `outputs/model.pt` and `outputs/snapshots.npz`. |
-| `scripts/analyze.py`     | Runs DMDc once, computes eigenvalues of $A$; writes `outputs/analysis.npz`. |
-| `scripts/test.py`        | Loads the trained model; prints its test-set metric to stdout. |
-| `scripts/plot_loss.py`   | Writes `outputs/plots/dmdc_loss.png`. |
-| `scripts/plot_accuracy.py`     | Writes `outputs/plots/dmdc_accuracy.png`. |
-| `scripts/plot_eigenvalues.py`  | Writes `outputs/plots/dmdc_eigenvalues.png`. |
+## Experiment system
 
-## Pipeline
+The whole project is organised around a two-tier cache:
 
 ```
-neural_dmd/config.py
-        │
-        ▼
-scripts/train.py ─────────► outputs/model.pt
-                            outputs/snapshots.npz
-                                    │
-                                    ▼
-                            scripts/analyze.py ───► outputs/analysis.npz
-                                    │
-        ┌────────────────┬──────────┴───────────┬────────────────────────────┐
-        ▼                ▼                      ▼                            ▼
-  scripts/test.py  scripts/plot_loss.py  scripts/plot_accuracy.py  scripts/plot_eigenvalues.py
-        │                │                      │                            │
-     stdout         outputs/plots/         outputs/plots/               outputs/plots/
-                    dmdc_loss.png          dmdc_accuracy.png            dmdc_eigenvalues.png
+outputs/
+  data/<data_hash>/                    training artifacts (content-addressed)
+    snapshots.npz
+    model.pt
+    train_config.json
+    train.log
+  experiments/<exp_id>/                analysis runs (one per invocation)
+    manifest.json                      exp metadata
+    config.json                        full config snapshot
+    metrics.json                       per-method metrics (incremental)
+    run.log                            tee'd stdout/stderr
+    analyses/<method>.npz              one per method that ran
+    plots/<method>/{loss, accuracy, eigenvalues}.png
+    summary.html
 ```
 
-| Step                          | Inputs                                       | Outputs                                              |
-|-------------------------------|----------------------------------------------|------------------------------------------------------|
-| `scripts/train.py`            | (downloads MNIST into `data/`)               | `outputs/model.pt`, `outputs/snapshots.npz`          |
-| `scripts/analyze.py`          | `outputs/snapshots.npz`                      | `outputs/analysis.npz`                               |
-| `scripts/test.py`             | `outputs/model.pt`                           | trained-model metric (stdout)                        |
-| `scripts/plot_loss.py`        | `outputs/snapshots.npz`, `outputs/analysis.npz` | `outputs/plots/dmdc_loss.png`                     |
-| `scripts/plot_accuracy.py`    | `outputs/snapshots.npz`, `outputs/analysis.npz` | `outputs/plots/dmdc_accuracy.png`                 |
-| `scripts/plot_eigenvalues.py` | `outputs/analysis.npz`                       | `outputs/plots/dmdc_eigenvalues.png`                 |
+### Data cache (`outputs/data/<data_hash>/`)
 
-`analyze.py` performs the only computationally significant work in the
-analysis pipeline (the SVDs). The plot scripts consume its cached output
-and may be re-run independently.
+`<data_hash>` is the first 12 hex digits of `sha256(<training-relevant
+config>)`. The exact fields hashed live in
+`neural_dmd.experiments.TRAIN_FIELDS`:
+
+```
+DATASET, ARCH, EPOCHS, BATCH_SIZE, LR, LR_MIN, LOSS,
+FIT_FRAC, FIT_RANGE,
+SNAP_FIT_EVERY, SNAP_FORECAST_EVERY,
+SEED,
++ source code of control_fn
+```
+
+Change any of those → `data_hash` flips → fresh training run. Change
+anything else (`RANK`, `METHOD_PARAMS`, `EXP_LABEL`, ...) → cache hit,
+training is reused, only the analyses re-run.
+
+`scripts/train.py` is also content-addressed: it skips entirely if the
+target `outputs/data/<hash>/` already has both `snapshots.npz` and
+`model.pt`. Use `--force` to retrain anyway.
+
+### Experiments (`outputs/experiments/<exp_id>/`)
+
+`<exp_id>` = `<YYYY-MM-DD_HH-MM-SS>_<EXP_LABEL>`. Always sortable;
+unique within a wall-clock second.
+
+Set `EXP_LABEL` (and optionally `EXP_DESCRIPTION`) in `config.py` to
+name the run. Different labels live side-by-side under
+`outputs/experiments/`; nothing is overwritten across runs.
+
+The orchestrator (`scripts/run_exp.py`) is the canonical entry point.
+It
+
+1. Mints a fresh `exp_id` and creates the directory structure.
+2. Tees `stdout`/`stderr` into `run.log`.
+3. Computes `data_hash`. Cache miss → run `train.py`. Cache hit → log
+   "data cache HIT, reusing".
+4. For each method in `config.METHODS`, runs analyse + 3 plots.
+5. Writes `summary.html` from the accumulated `metrics.json`.
+
+### Active experiment (env var)
+
+`NEURAL_DMD_EXP_ID` selects the active experiment for any script
+invocation. `run_exp.py` sets it implicitly so child analyses inherit
+it. Standalone scripts (e.g. `scripts/plot_loss_dmdc.py`) resolve the
+active experiment in this order:
+
+1. `NEURAL_DMD_EXP_ID` env var (use it if set).
+2. Lexicographically-latest existing experiment under
+   `outputs/experiments/`.
+3. A freshly-minted experiment.
+
+So to re-run a single plot inside an existing experiment:
+
+```bash
+# implicit (uses the latest experiment)
+python scripts/plot_eigenvalues_dmdc.py
+
+# explicit
+NEURAL_DMD_EXP_ID=2026-05-05_04-08-09_plateau-test \
+  python scripts/plot_eigenvalues_dmdc.py
+```
+
+---
+
+## Configuration
+
+Everything lives in `neural_dmd/config.py`. Knobs are grouped into:
+
+| Group                 | Examples                                                    |
+|-----------------------|-------------------------------------------------------------|
+| `EXPERIMENT`          | `EXP_LABEL`, `EXP_DESCRIPTION`, `METHODS`                   |
+| `TRAINING`            | `DATASET`, `ARCH`, `EPOCHS`, `LR`, `LOSS`, `SEED`           |
+| `SNAPSHOT RECORDER`   | `SNAP_FIT_EVERY`, `SNAP_FORECAST_EVERY`, `FIT_FRAC`, `FIT_RANGE` |
+| `METHOD PARAMS`       | `METHOD_PARAMS["<method>"]` dict (rank, LM hyperparams, dt) |
+| `NUMERICAL TOLERANCE` | `EIG_STABLE_TOL`                                            |
+| `RUNTIME`             | `DEVICE`                                                    |
+
+### Picking which methods to run
+
+```python
+METHODS = ("dmdc", "sdmdc", "optdmdc", "coptdmdc")   # everything (default)
+METHODS = ("dmdc",)                                  # baseline only
+METHODS = ("dmdc", "sdmdc")                          # cheap variants
+METHODS = ("optdmdc", "coptdmdc")                    # LM-based variants
+```
+
+`run_exp.py --methods a,b,...` overrides for a single invocation
+without editing the config.
+
+### Per-method hyperparameters
+
+```python
+METHOD_PARAMS = {
+    "dmdc":     {"rank": None},
+    "sdmdc":    {"rank": None, "dt": float(SNAP_FIT_EVERY)},
+    "optdmdc":  {"rank": 50, "pod_rank": None,
+                 "max_iter": 50, "tol": 1e-6, "gmax": 50,
+                 "incr": 1.5, "decr": 2.0, "nu0": 2.0,
+                 "dt":  float(SNAP_FIT_EVERY)},
+    "coptdmdc": {"rank": 50, "pod_rank": None,
+                 "max_iter": 50, "tol": 1e-6, "gmax": 50,
+                 "incr": 1.5, "decr": 2.0, "nu0": 2.0,
+                 "dt":  float(SNAP_FIT_EVERY)},
+}
+```
+
+`rank` is the LM operator size (memory-bounded, since the dense Jacobian
+scales like `~16 * (m_fit-1) * rank^2` bytes). `pod_rank` is decoupled
+and only governs the in-sample reconstruction lift, so the in-fit
+accuracy plot can show ~100% even when the dynamics live in a small
+subspace.
+
+### Fit-window selection (`FIT_RANGE`)
+
+```python
+FIT_FRAC  = 0.5          # fit on [0, FIT_FRAC * total_steps)
+FIT_RANGE = None         # falls back to FIT_FRAC
+
+FIT_RANGE = (3000, 5000) # explicit fit window in gradient steps
+```
+
+`FIT_RANGE` is participating in `data_hash`, so changing it forces a
+fresh training run. Use case: fit on a converged plateau region by
+setting `FIT_RANGE = (start_of_plateau, end_of_plateau)` and bumping
+`EPOCHS` so total_steps extends past `end_of_plateau`.
+
+---
+
+## Adding a new method
+
+1. Implement `neural_dmd/<name>.py` with a `run(snap, **kwargs)`
+   returning a dict containing at least
+   `{X_pred, A, eigenvalues (or A only), rank, fit_split}`.
+2. Add it to `neural_dmd.methods.METHODS` (label, run callable, has_lm
+   flag, blurb).
+3. Add hyperparameters in `config.METHOD_PARAMS["<name>"]` (or empty
+   dict if none).
+4. Mention the method in `config.METHODS` so it runs in the
+   experiment.
+
+The orchestrator + thin per-method scripts (`scripts/analyze_<name>.py`
+etc.) pick it up automatically. Generate the four wrappers with the
+heredoc loop in this README's `Add a method` cookbook (see
+`scripts/run_exp.py` source for the pattern).
+
+---
+
+## What `summary.html` looks like
+
+A self-contained HTML page (open in any browser; PNG plots are inlined
+as base64 data URLs so the file is portable). Sections in order:
+
+1. **Header** — exp_id, label, description (italic call-out), run time,
+   data hash, list of methods that ran.
+2. **Metrics** table — one row per method, columns:
+   `Rank | POD rank | Spectral ρ | λ>1 | In Δacc% | Out Δacc% | In Δloss
+   | Out Δloss | Wall (s)`.
+   Cells with `λ>1 > 0` or NaN are highlighted red; `λ>1 = 0` green.
+3. **Forecast-region final / min** table — `actual final L | pred final
+   L | actual min L | pred min L | actual final acc% | pred final acc%`
+   (only when loss plots ran).
+4. **Eigenvalue stability** — for each method, either a green "all
+   eigenvalues inside unit circle" note, or an `<h3>` + monospaced
+   `λ_N = re+imj  |λ|=mag  excess=±N` list of every eigenvalue outside
+   `1 + EIG_STABLE_TOL`.
+5. **LM convergence** (only for OptDMDc / cOptDMDc when present) -
+   initial → final residual + iter count + restart count.
+6. **Plots** — one card per method, three embedded PNGs (loss,
+   accuracy, eigenvalues) with captions.
+
+The same eigenvalue diagnostic is logged at console-time inside every
+analyse run (see `experiments.log_eigenvalue_report`), so spurious
+modes are visible in `run.log` too.
+
+---
+
+## Pipeline & module layout
+
+```
+neural_dmd/                       library
+  config.py                       all knobs
+  experiments.py                  hashing, paths, manifest, eigenvalue
+                                  reporting, metrics aggregation, summary
+  methods.py                      method registry (run callable + label)
+  runners.py                      do_analyze / do_plot_loss /
+                                  do_plot_accuracy / do_plot_eigenvalues
+                                  + run_full_pipeline
+  dmdc.py                         method
+  sdmdc.py                        method
+  optdmdc.py                      method
+  coptdmdc.py                     method
+  data.py                         dataset registry + DataLoader factory
+  model.py                        MLP
+  schedule.py                     cosine LR
+  metrics.py                      LOSSES, METRICS, loss_at, metric_at
+  params.py                       flat <-> tensor parameter conversion
+  snapshots.py                    Recorder + .npz schema
+  figures.py                      matplotlib helpers
+  log.py                          ANSI-coloured logger + log_spectrum
+                                  + progress + banner
+
+scripts/                          runnable entry points (thin wrappers)
+  train.py                        cache-aware training
+  run_exp.py                      full pipeline orchestrator
+  analyze_<method>.py             4 thin wrappers -> runners.do_analyze
+  plot_loss_<method>.py           4 thin wrappers
+  plot_accuracy_<method>.py       4 thin wrappers
+  plot_eigenvalues_<method>.py    4 thin wrappers
+  test.py                         load model.pt + print test metric
+```
+
+Library modules contain no `__main__`; everything runnable lives in
+`scripts/`.
+
+---
+
+## Recipes
+
+### The "all" command — full pipeline
+
+```bash
+python scripts/run_exp.py
+```
+
+Trains if needed, then for every method in `config.METHODS` runs
+`analyze + plot_eigenvalues + plot_accuracy + plot_loss`, and aggregates
+metrics into `summary.html`.
+
+### Run only some methods
+
+```bash
+python scripts/run_exp.py --methods dmdc,sdmdc
+python scripts/run_exp.py --methods optdmdc
+```
+
+### Run only some operations (`--only`)
+
+```bash
+# only analyze + accuracy + eigenvalues (skip the slow loss eval)
+python scripts/run_exp.py --only analyze,plot_eigenvalues,plot_accuracy
+
+# shortcut alias for the above
+python scripts/run_exp.py --skip-loss
+
+# only the loss plot (analysis must already exist for these methods)
+python scripts/run_exp.py --only plot_loss
+
+# minimal: just the analysis npzs, no plots
+python scripts/run_exp.py --only analyze
+```
+
+Valid `--only` ops: `analyze`, `plot_eigenvalues`, `plot_accuracy`,
+`plot_loss`. They run in canonical order regardless of how you list
+them.
+
+### Methods × ops combined
+
+```bash
+# only DMDc accuracy + eigenvalue plots (assumes analyze already done)
+python scripts/run_exp.py --methods dmdc --only plot_accuracy,plot_eigenvalues
+
+# baseline DMDc full pipeline + sDMDc analyze only
+python scripts/run_exp.py --methods dmdc                       # all 4 ops for dmdc
+python scripts/run_exp.py --methods sdmdc --only analyze       # only analyse sdmdc
+```
+
+### Re-run a single method (single-script style)
+
+```bash
+python scripts/analyze_optdmdc.py
+python scripts/plot_eigenvalues_optdmdc.py
+python scripts/plot_accuracy_optdmdc.py
+python scripts/plot_loss_optdmdc.py
+```
+
+These resolve the active experiment as: env var → latest existing →
+fresh.
+
+### Re-run inside a specific historical experiment
+
+```bash
+NEURAL_DMD_EXP_ID=2026-05-05_04-08-09_default \
+  python scripts/plot_loss_optdmdc.py
+```
+
+### Force a fresh training run
+
+```bash
+python scripts/run_exp.py --force-train
+```
+
+### Compare two configurations side by side
+
+Edit `EXP_LABEL` between runs (e.g. `"plateau-test"` then `"warm-start"`)
+and run `run_exp.py` twice. The two experiments live independently
+under `outputs/experiments/` and reuse the same training data when the
+training-relevant fields match.
+
+---
+
+## How to read the metrics
+
+`summary.html` reports per-method numbers in two tables. Definitions:
+
+### Spectral ρ
+Largest eigenvalue magnitude of the reduced operator A. ρ ≤ 1 = forecast
+stays bounded; ρ > 1 = forecast grows over time.
+
+### λ>1
+Number of eigenvalues with `|λ| > 1 + EIG_STABLE_TOL` (1e-12 default).
+The eigenvalue stability section lists each one with its full complex
+value, magnitude, and how far above 1.0 it sits.
+
+### In Δacc% / Out Δacc%
+**Mean parameter-prediction L2 error**, in percent, over the in-fit /
+out-of-fit snapshot grid. Computed as
+
+```
+acc_pred(k) = 100 * (1 - ||x̂_k − x_k|| / ||x_k||)
+Out Δacc%   = mean over forecast points of |100 − acc_pred(k)|
+            = mean of 100 * ||x̂_k − x_k|| / ||x_k||
+```
+
+So `Out Δacc% = 16.21` means the forecasted weight vector is, on
+average, **16.21% off** from the true weight vector in L2 norm at each
+forecast snapshot. This is **NOT** test-accuracy of the predicted
+network; it's parameter-vector closeness. For genuine downstream test
+accuracy of the predicted network, see "Forecast-region final / min"
+below.
+
+### In Δloss / Out Δloss
+**Mean absolute test-loss deviation** between predicted and actual
+network at the snapshot grid:
+
+```
+ΔL_k     = | L(x̂_k; D) − L(x_k; D) |
+Out Δloss = mean over forecast points of ΔL_k
+```
+
+`L` is the loss in `config.LOSS` (cross-entropy by default), evaluated
+on the test set.
+
+### Forecast-region final / min table
+
+For methods where loss/accuracy plots ran, the second table reports:
+
+| Column            | Meaning                                                          |
+|-------------------|------------------------------------------------------------------|
+| actual final L    | true network's loss at the LAST snapshot in the forecast window  |
+| pred final L      | predicted network's loss at the same point                       |
+| actual min L      | minimum of true network's loss over the forecast window          |
+| pred min L        | minimum of predicted network's loss over the forecast window     |
+| actual final acc% | true network's downstream test METRIC at the last forecast point |
+| pred final acc%   | predicted network's downstream test METRIC at the same point     |
+
+`pred final L` close to `actual final L` = the forecast lands at the
+right loss. `pred min L` ≪ `actual min L` = the forecast undershoots
+(predicts an unrealistically good model at some point, often a
+diverging-mode artefact). `pred final acc%` close to `actual final
+acc%` = the forecast preserves the converged network's test performance.
+
+---
+
+## Method details
+
+### DMDc (Proctor, Brunton, Kutz - SIAM J. Appl. Dyn. Syst. 2016)
+
+`x_{k+1} ≈ A x_k + B u_k`. Reduced operator `F = U_x^T A U_x` of size
+`p × p` is computed by two SVDs:
+
+1. SVD of `Ω = [X_1; Υ]` → `U_o, Σ_o, V_o`.
+2. Independent SVD of `X_fit` → `U_x` (output POD basis).
+
+Then `F = U_x^T X_2 V_o Σ_o^{-1} U_o^T U_x` and `G = U_x^T X_2 V_o
+Σ_o^{-1} U_2^T`. Forecast iterates `y ← F y + G u` step-by-step.
+
+### sDMDc
+
+Same as DMDc, plus a single radial-projection of the eigenvalues:
+
+```
+gamma_clipped = min(Re(gamma), 0) + Im(gamma) * i
+mu_clipped    = exp(gamma_clipped * dt)
+F_new         = Z diag(mu_clipped) Z^{-1}
+```
+
+No LM. Cheapest stable variant.
+
+### OptDMDc (Askham-Kutz 2018, extended in Rains et al. 2024 §2.3)
+
+Variable projection over the continuous-time eigenvalues `gamma`:
+
+```
+H_0^T = Psi(gamma, t) * Omega          where  Omega = Psi^+ H_0^T
+min_gamma || H_0^T - Psi(gamma) Omega(gamma) ||_F
+```
+
+Solved by Levenberg-Marquardt. The dense Jacobian `J^mat_j` is built
+column-by-column from closed-form pieces (paper Eq. 32) and the
+augmented LSQ system is recast in real arithmetic for `numpy.linalg.lstsq`.
+No stability constraint - eigenvalues can land anywhere in the complex
+plane.
+
+### cOptDMDc (Rains et al. JCP 2024 §2.4)
+
+Same as OptDMDc plus
+
+1. Initial radial projection: `gamma <- min(Re(gamma), 0) + Im(gamma) * i`.
+2. Linear inequality constraint on the LM update:
+   `Re(delta) >= Re(gamma)` so `Re(gamma_new) = Re(gamma) - Re(delta) ≤ 0`.
+
+The constrained LSQ subproblem is recast in real arithmetic and solved
+by `scipy.optimize.lsq_linear` with `bounds=(...)`.
+
+---
 
 ## Installation
 
-Install `uv`:
-
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
+curl -LsSf https://astral.sh/uv/install.sh | sh   # macOS / Linux
+# or
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
 
-On Windows (PowerShell):
-
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-Create the environment and install dependencies:
-
-```bash
 uv venv
 uv pip install -r requirements.txt
 ```
 
-## Running
+CUDA is used automatically when available, otherwise CPU.
 
-Full pipeline:
+## References
 
-```bash
-uv run python scripts/train.py            && \
-uv run python scripts/analyze.py          && \
-uv run python scripts/test.py             && \
-uv run python scripts/plot_loss.py        && \
-uv run python scripts/plot_accuracy.py    && \
-uv run python scripts/plot_eigenvalues.py
-```
-
-The first invocation of `train.py` downloads MNIST into `data/`. CUDA is
-used automatically when available, otherwise the CPU. The `outputs/` and
-`outputs/plots/` directories are created on first run.
-
-## Extension points
-
-| To change                         | Edit                                                                  |
-|-----------------------------------|-----------------------------------------------------------------------|
-| Dataset                           | `config.DATASET` (must be registered in `data.DATASETS`); update `config.ARCH` accordingly. |
-| Network architecture              | `config.ARCH` (list of MLP layer widths).                             |
-| Loss function                     | Add to `metrics.LOSSES`, then set `config.LOSS`.                      |
-| Evaluation metric                 | Add to `metrics.METRICS`, then set `config.METRIC`.                   |
-| Control input $u_k$               | `config.control_fn(optimizer, step)`.                                 |
-| Fit-region snapshot cadence       | `config.SNAP_FIT_EVERY`.                                              |
-| Forecast-region snapshot cadence  | `config.SNAP_FORECAST_EVERY`.                                         |
-| Fit / forecast split              | `config.FIT_FRAC` ($\in [0, 1]$).                                     |
-| DMDc rank truncation              | `config.RANK` (`None` = full available; integer for explicit truncation). |
-| Epochs and learning rate          | `config.EPOCHS`, `config.LR`, `config.LR_MIN`.                        |
+- Proctor, J. L., Brunton, S. L., & Kutz, J. N. (2016). *Dynamic Mode
+  Decomposition with Control*. SIAM J. Appl. Dyn. Syst., 15(1).
+- Askham, T., & Kutz, J. N. (2018). *Variable Projection Methods for an
+  Optimized DMD*. SIAM J. Appl. Dyn. Syst., 17(1).
+- Rains, J., Wang, Y., House, A., Kaminsky, A. L., Tison, N. A., &
+  Korivi, V. M. (2024). *Constrained optimized dynamic mode
+  decomposition with control for physically stable systems with
+  exogeneous inputs*. J. Comput. Phys., 496, 112604.

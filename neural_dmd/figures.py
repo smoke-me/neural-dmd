@@ -13,13 +13,26 @@ import numpy as np
 
 def comparison_plot(steps, actual, predicted, split, *,
                     out_path, title, ylabel,
-                    actual_label, pred_label, summary_label):
+                    actual_label, pred_label, summary_label,
+                    fit_start_idx: int = 0,
+                    y_clip: tuple | None = None,
+                    auto_clip_factor: float = 10.0):
     # steps         : (m,) x-axis (training step index of each snapshot)
     # actual        : (m,) y-values from the real x_k
     # predicted     : (m,) y-values from the DMDc forecast x_hat_k
-    # split         : index where fit ends and forecast begins
+    # split         : snapshot index where fit ends (one past the last
+    #                 fit-region snapshot, i.e. fit_split / fit_end_idx)
+    # fit_start_idx : snapshot index where fit begins; defaults to 0 for
+    #                 the historical FIT_RANGE = None case
     # title, ylabel : figure decoration
     # *_label       : strings shown in legend / x-axis footer
+    # y_clip        : explicit (y_lo, y_hi) bounds. None -> auto-clip when
+    #                 predicted dwarfs actual (see auto_clip_factor).
+    # auto_clip_factor: when |predicted|.max() exceeds this multiple of
+    #                 |actual|.max(), or when predicted has any non-finite
+    #                 values, clip y-axis to a window around actual's
+    #                 range so the actual curve stays readable. Off-scale
+    #                 predicted points are flagged in an inset.
     plt.style.use("dark_background")
     fig, ax = plt.subplots(figsize=(11, 5.2), constrained_layout=True)
 
@@ -27,23 +40,77 @@ def comparison_plot(steps, actual, predicted, split, *,
     c_pred   = "#ffb27a"     # warm orange - DMDc curve
     c_fit_bg = "#5ed3d3"     # tint of the fit-region shaded band
 
-    split_x = steps[split - 1]
+    a = np.asarray(actual,    dtype=float)
+    p = np.asarray(predicted, dtype=float)
     m = len(steps)
+    split = max(int(split), fit_start_idx + 1)
+    fit_left_x  = steps[fit_start_idx]
+    fit_right_x = steps[split - 1]
 
-    # Shaded background for the fit region.
-    ax.axvspan(steps[0], split_x, color=c_fit_bg, alpha=0.06, lw=0)
+    # Shaded background for the fit window only.
+    ax.axvspan(fit_left_x, fit_right_x, color=c_fit_bg, alpha=0.06, lw=0)
 
-    # The two curves we are comparing.
-    ax.plot(steps, actual,    color=c_actual, lw=2.2, label=actual_label)
-    ax.plot(steps, predicted, color=c_pred,   lw=2.0, ls="--", label=pred_label)
+    # Curves.
+    ax.plot(steps, a, color=c_actual, lw=2.2, label=actual_label)
+    ax.plot(steps, p, color=c_pred,   lw=2.0, ls="--", label=pred_label)
 
-    # Bold dashed marker for the boundary between fit and forecast.
-    ax.axvline(split_x, color="#ffffff", ls="--", lw=1.6, alpha=0.7,
-               label=f"fit / forecast split  (k={split_x})")
+    # Right-side fit/forecast split (always drawn).
+    ax.axvline(fit_right_x, color="#ffffff", ls="--", lw=1.6, alpha=0.7,
+               label=f"fit / forecast split  (k={fit_right_x})")
+    # Left-side fit-window boundary (only when the fit window does not
+    # start at step 0, i.e. when FIT_RANGE was set).
+    if fit_start_idx > 0:
+        ax.axvline(fit_left_x, color="#ffffff", ls="--", lw=1.2, alpha=0.5,
+                   label=f"pre-fit boundary  (k={fit_left_x})")
+
+    # ----- y-axis clipping -----
+    # If predicted explodes (NaN / inf / huge magnitude vs actual), clip
+    # the y-axis to a window around actual's range so the actual curve
+    # stays visible. Predicted points outside the window are drawn at
+    # the boundary; their count is shown in an annotation so the reader
+    # knows the curve is being cut off.
+    p_finite_mask = np.isfinite(p)
+    a_finite      = a[np.isfinite(a)]
+    if a_finite.size == 0:
+        y_lo, y_hi = (None, None)
+    else:
+        a_min, a_max = float(a_finite.min()), float(a_finite.max())
+        a_span = max(a_max - a_min, 1e-12)
+
+        if y_clip is not None:
+            y_lo, y_hi = y_clip
+        elif (not p_finite_mask.all()) or (
+                p_finite_mask.any() and
+                np.nanmax(np.abs(p[p_finite_mask])) >
+                auto_clip_factor * max(abs(a_min), abs(a_max), a_span)):
+            pad = 0.5 * a_span
+            y_lo = a_min - pad
+            y_hi = a_max + pad
+        else:
+            y_lo, y_hi = (None, None)
+
+    if y_lo is not None and y_hi is not None:
+        ax.set_ylim(y_lo, y_hi)
+        n_above = int(((p > y_hi) | ~p_finite_mask).sum())
+        n_below = int((p < y_lo).sum())
+        n_off   = n_above + n_below
+        if n_off > 0:
+            p_show = p[p_finite_mask]
+            extreme = (f"max|pred|={np.max(np.abs(p_show)):.2e}"
+                       if p_show.size else "all NaN/inf")
+            ax.text(
+                0.99, 0.97,
+                f"⚠ {n_off}/{m} predicted points off-scale ({extreme})",
+                transform=ax.transAxes, ha="right", va="top",
+                fontsize=8.5, color="#ff9999",
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="#000000aa",
+                          edgecolor="#ff9999", linewidth=0.6))
+
+    # split labels (placed AFTER ylim has been set so positioning is sane)
     y_top = ax.get_ylim()[1]
-    ax.text(split_x, y_top * 0.97, " ← fit",      color="#dddddd",
+    ax.text(fit_right_x, y_top * 0.97, " ← fit",      color="#dddddd",
             fontsize=10, ha="right", va="top")
-    ax.text(split_x, y_top * 0.97, " forecast →", color="#dddddd",
+    ax.text(fit_right_x, y_top * 0.97, " forecast →", color="#dddddd",
             fontsize=10, ha="left",  va="top")
 
     ax.set_ylabel(ylabel)
@@ -51,9 +118,18 @@ def comparison_plot(steps, actual, predicted, split, *,
     ax.legend(frameon=False, loc="best")
     ax.grid(alpha=0.18)
 
-    # Footer: mean absolute curve mismatch in / out of sample.
-    in_  = float(np.mean(np.abs(predicted[:split] - actual[:split])))
-    out_ = float(np.mean(np.abs(predicted[split:] - actual[split:]))) if split < m else float("nan")
+    # Footer: mean absolute mismatch within / outside the fit window.
+    # Use nanmean and skip non-finite points so a single overflowed
+    # value doesn't poison the whole summary.
+    in_mask = np.zeros(m, dtype=bool)
+    in_mask[fit_start_idx:split] = True
+    out_mask = ~in_mask
+    def _safe_mean(mask):
+        diff = np.abs(p[mask] - a[mask])
+        finite = np.isfinite(diff)
+        return float(diff[finite].mean()) if finite.any() else float("nan")
+    in_  = _safe_mean(in_mask)
+    out_ = _safe_mean(out_mask)
     ax.set_xlabel(
         "training step  $k$\n" + summary_label.format(in_=in_, out=out_),
         fontsize=9,
@@ -61,9 +137,10 @@ def comparison_plot(steps, actual, predicted, split, *,
 
     fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
+    return {"in_sample": in_, "out_sample": out_}
 
 
-def eigenvalue_plot(eigenvalues, *, out_path, title):
+def eigenvalue_plot(eigenvalues, *, out_path, title, stable_tol: float = 0.0):
     # Scatter plot in the complex plane of the eigenvalues of the DMDc
     # operator A.
     #   - dashed circle = unit circle |lambda| = 1 (the stability boundary
@@ -73,12 +150,17 @@ def eigenvalue_plot(eigenvalues, *, out_path, title):
     #     or grows (warm orange, |lambda| > 1) when iterated forward
     #   - axis bounds adapt to whichever is larger: the unit circle or the
     #     furthest eigenvalue (so distant outliers are always visible)
+    # `stable_tol` widens the "stable" classification window: a mode with
+    # |lambda| <= 1 + stable_tol is shown stable. Used by cOptDMDc whose
+    # radial projection puts eigenvalues exactly on the unit circle - in
+    # floating-point those land at 1.0 +/- ~1e-16, and a strict cutoff
+    # would mislabel them as unstable.
     plt.style.use("dark_background")
     fig, ax = plt.subplots(figsize=(7.0, 7.0), constrained_layout=True)
 
     eig = np.asarray(eigenvalues).astype(np.complex128)
     mags = np.abs(eig)
-    stable_mask = mags <= 1.0
+    stable_mask = mags <= 1.0 + stable_tol
     n_stable   = int(stable_mask.sum())
     n_unstable = int((~stable_mask).sum())
     spectral_radius = float(mags.max()) if mags.size else 0.0

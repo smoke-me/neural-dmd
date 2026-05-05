@@ -1,63 +1,83 @@
 """
-Single source of truth for everything tunable in the experiment.
+Single source of truth for every tunable knob.
 
-Edit values in this file - downstream modules read from here, so you do
-NOT need to touch other files for typical changes.
+Path resolution (where snapshots / model / analyses / plots actually
+live on disk) is delegated to neural_dmd.experiments - this file only
+declares values, never composes file paths under outputs/.
 
-To plug in something completely new (a new dataset, a new loss, a new
-control input):
-  - dataset:        register a (Dataset class, transform) pair in data.DATASETS
-  - loss / metric:  register a callable in metrics.LOSSES or metrics.METRICS
-  - architecture:   change ARCH (list of layer sizes for the MLP)
-  - control input:  edit control_fn() below to return whatever vector u_k
-                    you want DMDc to learn against
+Knobs are grouped:
+
+  EXPERIMENT          - identification + which methods to run
+  TRAINING            - dataset, model architecture, optimiser, schedule
+  SNAPSHOT RECORDER   - cadence + fit window
+  METHOD PARAMS       - per-method hyperparameters (METHOD_PARAMS dict)
+  NUMERICAL TOLERANCE - one shared knob for stability classification
+  RUNTIME             - device etc.
+
+To plug in something new:
+  - dataset:       register a (Dataset class, transform) pair in data.DATASETS
+  - loss / metric: register a callable in metrics.LOSSES or metrics.METRICS
+  - architecture:  change ARCH (list of MLP layer widths)
+  - control input: edit control_fn() below
+  - method:        register in neural_dmd.methods.METHODS, add an entry
+                   to METHOD_PARAMS, list it in METHODS
 """
 
 from pathlib import Path
 
 import torch
 
+
 # ---------------------------------------------------------------------------
-# project paths
-#
-# All paths are resolved relative to the project root (the parent of the
-# `neural_dmd/` package directory) so the scripts work regardless of which
-# directory you launch them from. Generated artifacts are organised into
-# outputs/ and outputs/plots/ to keep the repo root clean.
+# project root paths (raw filesystem only - everything else is dispatched
+# through neural_dmd.experiments at runtime)
 # ---------------------------------------------------------------------------
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT    = PROJECT_ROOT / "data"            # input cache (MNIST, ...)
-OUTPUT_ROOT  = PROJECT_ROOT / "outputs"         # generated artifacts
-PLOTS_ROOT   = OUTPUT_ROOT  / "plots"           # generated figures
+OUTPUT_ROOT  = PROJECT_ROOT / "outputs"         # all generated artifacts live under here
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-PLOTS_ROOT.mkdir(parents=True, exist_ok=True)
 
-# --- dataset ---
-DATASET    = "mnist"          # see data.DATASETS for the registered options
+# Backwards-compat alias used by some plot scripts that don't yet route
+# through experiments.* (kept for transition; prefer the experiments
+# module helpers in new code).
+PLOTS_ROOT = OUTPUT_ROOT / "plots"
+
+
+# ---------------------------------------------------------------------------
+# EXPERIMENT
+# ---------------------------------------------------------------------------
+
+# Used to name the experiment directory:
+#   outputs/experiments/<YYYY-MM-DD_HH-MM-SS>_<EXP_LABEL>/
+EXP_LABEL       = "baseline"
+EXP_DESCRIPTION = (
+    "Fit on first 50% of the data, predict the next 50%.")
+
+# Which methods to run for this experiment. Order is preserved in
+# summary.md tables. Entries must exist in neural_dmd.methods.METHODS.
+METHODS = ("dmdc", "sdmdc", "optdmdc", "coptdmdc")
+
+
+# ---------------------------------------------------------------------------
+# TRAINING
+# ---------------------------------------------------------------------------
+
+DATASET    = "mnist"          # see data.DATASETS for registered options
 BATCH_SIZE = 100              # train batch size (60000/100 = 600 steps/epoch exactly)
 EVAL_BATCH = 1000             # eval batch size (no grads, can be larger)
 
-# --- model ---
 # Layer widths for the MLP. The first must equal the flattened input
 # dimension of the dataset (28*28=784 for MNIST, 32*32*3=3072 for CIFAR-10).
 # The last must equal the number of classes.
 ARCH = [784, 128, 64, 10]
 
-# --- training ---
-EPOCHS = 5
+EPOCHS = 10
 LR     = 1e-3
 LR_MIN = 0.0                  # cosine-annealing floor
-LOSS   = "cross_entropy"      # name in metrics.LOSSES used for training + plot_loss.py
+LOSS   = "cross_entropy"      # name in metrics.LOSSES used for training + plot_loss
 METRIC = "accuracy"           # name in metrics.METRICS used by test.py
-
-# --- snapshot recorder ---
-# Two cadences. Inside the FIT region (the first FIT_FRAC of training) we
-# record every SNAP_FIT_EVERY gradient steps - dense data so DMDc has a lot
-# to fit on. Inside the FORECAST region we record every SNAP_FORECAST_EVERY
-# gradient steps - sparse comparison points where we check how the
-# forecast is doing.
-SNAP_FIT_EVERY      = 1
-SNAP_FORECAST_EVERY = 50
+SEED   = 0                    # torch + numpy seed; participates in data_hash
 
 
 def control_fn(optimizer, step):
@@ -68,28 +88,81 @@ def control_fn(optimizer, step):
     of B per control dimension.
 
     Called every step (not only on snapshot steps) so the recorder stores
-    the full per-step control sequence U. The forecast iteration needs
-    u_k for every step in the forecast region too.
-
-    Examples:
-        return [optimizer.param_groups[0]["lr"]]                       # lr only
-        return [optimizer.param_groups[0]["lr"], some_other_signal]    # lr + extra
+    the full per-step control sequence U.
     """
     return [optimizer.param_groups[0]["lr"]]
 
 
-# --- DMDc analysis ---
-FIT_FRAC = 0.5                # fraction of training steps to FIT on; rest is forecast
-RANK     = None               # truncation rank (None = full available)
+# ---------------------------------------------------------------------------
+# SNAPSHOT RECORDER + FIT WINDOW
+#
+# FIT_RANGE = (start, end)   dense snapshots in [start, end)
+#                            sparse elsewhere  (= forecast cadence)
+# FIT_RANGE = None           use FIT_FRAC: fit on [0, FIT_FRAC * total_steps)
+#
+# FIT_RANGE wins if both are set. SNAP_FIT_EVERY governs cadence inside
+# the fit window; SNAP_FORECAST_EVERY governs cadence outside (both
+# pre-fit and post-fit). Both are training-relevant: changing them
+# invalidates the data_hash and forces a fresh training run.
+# ---------------------------------------------------------------------------
+
+SNAP_FIT_EVERY      = 1
+SNAP_FORECAST_EVERY = 50
+
+FIT_FRAC  = 0.5
+FIT_RANGE = None
 
 # ---------------------------------------------------------------------------
-# artifact paths (always under outputs/)
+# METHOD PARAMS
+#
+# Per-method hyperparameters keyed by method name. Each method's run()
+# is invoked with **METHOD_PARAMS[name].
+#
+# Memory note for OptDMDc / cOptDMDc: the dense Jacobian is
+#     ~16 * (m_fit-1) * rank^2 bytes
+# At rank=200 that's ~2 GB per LM iter. Keep rank modest unless you
+# rebuild on top of a matrix-free LinearOperator path.
 # ---------------------------------------------------------------------------
-CKPT_PATH     = OUTPUT_ROOT / "model.pt"        # written by train.py
-SNAP_PATH     = OUTPUT_ROOT / "snapshots.npz"   # written by train.py
-ANALYSIS_PATH = OUTPUT_ROOT / "analysis.npz"    # written by analyze.py
-LOSS_PLOT     = PLOTS_ROOT  / "dmdc_loss.png"
-ACC_PLOT      = PLOTS_ROOT  / "dmdc_accuracy.png"
-EIG_PLOT      = PLOTS_ROOT  / "dmdc_eigenvalues.png"
+
+METHOD_PARAMS: dict[str, dict] = {
+    "dmdc":     {"rank": None},
+    "sdmdc":    {"rank": None,
+                 "dt":   float(SNAP_FIT_EVERY)},
+    "optdmdc":  {"rank":     50,
+                 "pod_rank": None,
+                 "max_iter": 50,
+                 "tol":      1e-6,
+                 "gmax":     50,
+                 "incr":     1.5,
+                 "decr":     2.0,
+                 "nu0":      2.0,
+                 "dt":       float(SNAP_FIT_EVERY)},
+    "coptdmdc": {"rank":     50,
+                 "pod_rank": None,
+                 "max_iter": 50,
+                 "tol":      1e-6,
+                 "gmax":     50,
+                 "incr":     1.5,
+                 "decr":     2.0,
+                 "nu0":      2.0,
+                 "dt":       float(SNAP_FIT_EVERY)},
+}
+
+
+# ---------------------------------------------------------------------------
+# NUMERICAL TOLERANCE
+# ---------------------------------------------------------------------------
+
+# cOptDMDc puts radially-projected eigenvalues exactly on the unit
+# circle (Re(gamma)=0 -> |exp(gamma*dt)| = sqrt(cos^2 + sin^2) = 1).
+# In floating-point, np.abs of cos + i*sin may round to 1.0 +/- ~1e-16,
+# so a strict "> 1" check classifies on-circle eigenvalues as unstable.
+# Anything within tol of the unit circle is treated as stable.
+EIG_STABLE_TOL = 1e-12
+
+
+# ---------------------------------------------------------------------------
+# RUNTIME
+# ---------------------------------------------------------------------------
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

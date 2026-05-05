@@ -1,6 +1,22 @@
-# dataset + trained weights + DMDc artefacts (anything generated)
+# =============================================================================
+# generated artifacts (everything under outputs/ is regenerable from code)
+# =============================================================================
+
+# data cache + experiments + plots + summaries
+outputs/
+
+# downloaded datasets (MNIST, etc.)
 data/
+
+
+# =============================================================================
+# binary / large files (defensive — outputs/ should already cover these,
+# but if anyone hand-creates files at the repo root we don't want them in)
+# =============================================================================
+
 *.pt
+*.pth
+*.ckpt
 *.npz
 *.npy
 *.png
@@ -9,10 +25,54 @@ data/
 *.svg
 *.pdf
 *.csv
+*.log
 
+# generated summary.html lives in outputs/<exp_id>/
+*.html
+
+
+# =============================================================================
 # python
+# =============================================================================
+
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# uv / venv
+
+# =============================================================================
+# environments
+# =============================================================================
+
 .venv/
+venv/
+env/
+.env
+.python-version
+
+
+# =============================================================================
+# editor / OS
+# =============================================================================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+
+# =============================================================================
+# experiment tracking (if you wire it up later)
+# =============================================================================
+
+wandb/
+mlruns/
