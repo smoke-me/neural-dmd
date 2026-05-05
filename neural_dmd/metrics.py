@@ -14,7 +14,7 @@ Metric signature: (logits, targets) -> python float in [0, 1]
 import torch
 import torch.nn.functional as F
 
-from params import load_params
+from .params import load_params
 
 
 # --- loss functions ---

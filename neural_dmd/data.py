@@ -31,10 +31,12 @@ DATASETS = {
 }
 
 
-def get_loaders(name: str, batch_size: int, eval_batch: int, root: str):
+def get_loaders(name: str, batch_size: int, eval_batch: int, root):
     # Look up the Dataset class + transform for the chosen name and build
     # train / test DataLoaders. First call downloads the data into `root`.
+    # `root` may be a str or pathlib.Path; torchvision accepts either.
     DS, tx = DATASETS[name]
+    root = str(root)
     train = DS(root, train=True,  download=True, transform=tx)
     test  = DS(root, train=False, download=True, transform=tx)
     return (
