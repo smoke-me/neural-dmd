@@ -673,6 +673,11 @@ td.num {
 td.bad { color: var(--bad); font-weight: 600; }
 td.good { color: var(--good); font-weight: 600; }
 td.method-cell { font-weight: 600; }
+tr.best-rank td {
+  background: #ecfdf5;
+  font-weight: 600;
+  color: var(--good);
+}
 ul.eigvals {
   list-style: none;
   margin: 0.5em 0 1em;
@@ -751,8 +756,11 @@ def write_summary() -> None:
     dh        = manifest.get("data_hash", data_hash())
 
     methods_cfg = list(getattr(C, "METHODS", tuple(metrics.keys())))
-    methods = [m for m in methods_cfg if m in metrics] + \
-              [m for m in metrics if m not in methods_cfg]
+    # Method-row entries: ignore any "__meta__" keys (e.g. __rank_scan__),
+    # which are rendered in their own dedicated sections.
+    metric_methods = [m for m in metrics if not m.startswith("__")]
+    methods = [m for m in methods_cfg if m in metric_methods] + \
+              [m for m in metric_methods if m not in methods_cfg]
 
     h = html.escape
 
@@ -848,6 +856,40 @@ def write_summary() -> None:
             out.append('<div class="stable-note">'
                        f'<code>{h(method)}</code>: all eigenvalues inside unit circle '
                        f'(spectral radius {sr_str}).</div>')
+
+    # --- rank scan diagnostics (if the auto scan ran) ---
+    rs = metrics.get("__rank_scan__")
+    if rs:
+        out.append("<h2>LM rank scan</h2>")
+        out.append('<p class="note">Held-out forecast scan over candidate '
+                   "ranks; lowest validation L2 error wins. The chosen rank "
+                   "was patched into <code>METHOD_PARAMS</code> for both "
+                   "<code>optdmdc</code> and <code>coptdmdc</code>.</p>")
+        out.append('<dl class="meta">')
+        out.append(f"<dt>Best rank</dt><dd><code>{h(str(rs.get('best_rank')))}</code></dd>")
+        bve = rs.get("best_val_err")
+        out.append(f"<dt>Best val L2 error</dt><dd>{h(_fmt_cell('val_err', bve))}</dd>")
+        out.append(f"<dt>Patience</dt><dd>{h(str(rs.get('patience')))}</dd>")
+        out.append(f"<dt>Validation fraction</dt><dd>{h(str(rs.get('val_frac')))}</dd>")
+        out.append(f"<dt>Min relative improvement</dt><dd>{h(str(rs.get('min_improv')))}</dd>")
+        out.append("</dl>")
+
+        history = rs.get("history", []) or []
+        if history:
+            best_rank = rs.get("best_rank")
+            out.append("<table>")
+            out.append("<thead><tr><th>Candidate rank</th>"
+                       "<th>Validation rel. L2 error</th></tr></thead><tbody>")
+            for entry in history:
+                r = entry.get("rank")
+                e = entry.get("val_rel_err")
+                cls = ' class="best-rank"' if r == best_rank else ""
+                out.append(
+                    f"<tr{cls}>"
+                    f"<td class='num'><code>{h(str(r))}</code></td>"
+                    f"<td class='num'>{h(_fmt_cell('val_err', e))}</td>"
+                    "</tr>")
+            out.append("</tbody></table>")
 
     # --- LM convergence ---
     lm_methods = [m for m in methods
