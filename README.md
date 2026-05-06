@@ -178,6 +178,49 @@ and only governs the in-sample reconstruction lift, so the in-fit
 accuracy plot can show ~100% even when the dynamics live in a small
 subspace.
 
+### Auto rank scan (Opt / cOpt)
+
+```python
+LM_RANK_AUTO            = False                       # default: OFF
+LM_RANK_AUTO_CANDIDATES = (10, 25, 50, 100, 200, 400)
+LM_RANK_AUTO_PATIENCE   = 2
+LM_RANK_AUTO_VAL_FRAC   = 0.1
+LM_RANK_AUTO_MIN_IMPROV = 1e-3
+```
+
+When `LM_RANK_AUTO = True`, the pipeline runs a held-out forecast scan
+**before** OptDMDc / cOptDMDc analyze, picks the rank with lowest
+validation forecast error, and patches both methods' `rank` in
+`METHOD_PARAMS` so they agree.
+
+**Procedure:**
+1. Hold out the last `LM_RANK_AUTO_VAL_FRAC` (default 10%) of the fit window.
+2. For each rank in `LM_RANK_AUTO_CANDIDATES` (ascending):
+   - Fit the DMDc warm start on the remaining 90%.
+   - Forecast across the held-out segment.
+   - Compute mean relative L2 error.
+3. Track best rank. Stop early when `LM_RANK_AUTO_PATIENCE` consecutive
+   ranks fail to improve on the running best by `LM_RANK_AUTO_MIN_IMPROV`
+   (relative).
+
+**Why this is cheap:** the SVD cache in `dmdc._kernel` ensures the full
+O(n·m²) factorisation runs only **once** per scan; every candidate
+rank after that just slices the cached SVDs and rebuilds the small
+reduced operator. Total scan cost ≈ 1–3 minutes at default scale,
+regardless of how many candidates are listed.
+
+**Why warm-start (no LM)?** The full LM loop would make the scan
+prohibitively slow. The DMDc warm start is what Opt/cOpt initialise
+from anyway, and forecast quality of the warm start tracks the
+forecast quality of the optimised result closely enough to pick a
+good rank.
+
+**To turn OFF:** `LM_RANK_AUTO = False` (default). The static
+`METHOD_PARAMS["optdmdc"]["rank"]` / `["coptdmdc"]["rank"]` are used.
+
+The chosen rank + per-candidate validation error are saved under
+`metrics.json["__rank_scan__"]` for the experiment.
+
 ### LM early stopping (Opt / cOpt)
 
 Both `optdmdc.run` and `coptdmdc.run` halt the Levenberg-Marquardt
@@ -203,13 +246,23 @@ hasn't dropped by 0.1% per iter for 3 iters in a row". Tighter
 (`tol_rel = 1e-4, patience = 5`) lets LM run longer; looser
 (`tol_rel = 5e-3, patience = 1`) stops sooner.
 
+**To turn early stopping off**: set `tol_rel = 0.0` (or `patience = 0`)
+in `METHOD_PARAMS["optdmdc"]` / `METHOD_PARAMS["coptdmdc"]`. The
+patience criterion goes inert; only the absolute `tol` and the outer
+`max_iter` cap can stop the loop. Use this when you want every
+iteration spent — useful for diagnostic comparisons or when you
+genuinely want LM to chase the residual all the way down.
+
 ### Snapshot noise (`NOISE_SIGMA`)
 
 ```python
-NOISE_SIGMA = 0.0       # clean (default)
+NOISE_SIGMA = 0.0       # OFF: clean snapshots, no noise added (default)
 NOISE_SIGMA = 1e-3      # paper-faithful (Rains et al. 2024 §3.1)
 NOISE_SIGMA = 1e-2      # heavy noise; cOpt's de-biasing should beat DMDc here
 ```
+
+**To turn noise off**: set `NOISE_SIGMA = 0.0` (or any value `<= 0`).
+The injection call becomes a no-op; recorded snapshots are byte-clean.
 
 When `NOISE_SIGMA > 0`, every recorded parameter snapshot has zero-mean
 Gaussian noise added before `snapshots.npz` is written. The standard

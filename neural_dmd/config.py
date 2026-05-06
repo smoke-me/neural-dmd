@@ -72,7 +72,7 @@ EVAL_BATCH = 1000             # eval batch size (no grads, can be larger)
 # The last must equal the number of classes.
 ARCH = [784, 128, 64, 10]
 
-EPOCHS = 10
+EPOCHS = 5
 LR     = 1e-3
 LR_MIN = 0.0                  # cosine-annealing floor
 LOSS   = "cross_entropy"      # name in metrics.LOSSES used for training + plot_loss
@@ -116,7 +116,7 @@ FIT_RANGE = None
 # snapshot, simulating a noisy "measurement" of the underlying clean
 # trajectory. NOISE_SIGMA is RELATIVE to the global trajectory std, so:
 #
-#   NOISE_SIGMA = 0.0    clean (default)
+#   NOISE_SIGMA = 0.0    OFF: clean snapshots, no noise added (default)
 #   NOISE_SIGMA = 1e-3   ~paper-faithful (Rains et al. 2024 §3.1 noise study)
 #   NOISE_SIGMA = 1e-2   heavy noise; lets cOpt's de-biasing shine vs DMDc
 #
@@ -125,6 +125,9 @@ FIT_RANGE = None
 # Participates in the data_hash, so each noise level gets its own
 # outputs/data/<hash>/ cache and you can sweep noise levels by changing
 # this knob alone (no other config edits needed).
+#
+# To turn noise OFF: set NOISE_SIGMA = 0.0 (or any value <= 0). The
+# inject_snapshot_noise call becomes a no-op.
 NOISE_SIGMA = 0.0
 
 # ---------------------------------------------------------------------------
@@ -152,8 +155,13 @@ METHOD_PARAMS: dict[str, dict] = {
                  # accepted LM iterations. Catches the regime where LM
                  # is no longer fitting signal and starting to overfit
                  # in-fit noise (which destroys forecast quality).
-                 "tol_rel":  1e-3,
-                 "patience": 3,
+                 #
+                 # To turn early stopping OFF: set tol_rel = 0.0 (or any
+                 # value <= 0) OR patience = 0. The patience criterion
+                 # then becomes inert; only the absolute `tol` and the
+                 # outer `max_iter` cap can stop the loop.
+                 "tol_rel":  0,
+                 "patience": 0,
                  "gmax":     50,
                  "incr":     1.5,
                  "decr":     2.0,
@@ -163,14 +171,39 @@ METHOD_PARAMS: dict[str, dict] = {
                  "pod_rank": None,
                  "max_iter": 50,
                  "tol":      1e-6,
-                 "tol_rel":  1e-3,
-                 "patience": 3,
+                 # tol_rel = 0.0 disables early stopping (see optdmdc above)
+                 "tol_rel":  0,
+                 "patience": 0,
                  "gmax":     50,
                  "incr":     1.5,
                  "decr":     2.0,
                  "nu0":      2.0,
                  "dt":       float(SNAP_FIT_EVERY)},
 }
+
+
+# ---------------------------------------------------------------------------
+# AUTO RANK SCAN (for OptDMDc / cOptDMDc)
+#
+# When LM_RANK_AUTO is True, run_full_pipeline runs a quick held-out
+# forecast scan over LM_RANK_AUTO_CANDIDATES before invoking opt/copt.
+# The chosen rank is written into METHOD_PARAMS["optdmdc"|"coptdmdc"]
+# in place, so both LM methods agree on the same rank.
+#
+# Cost: thanks to the kernel's SVD cache, the first candidate pays the
+# full O(n*m^2) factorisation; subsequent candidates only rebuild the
+# small reduced operator F + run a forecast loop. A 6-candidate scan
+# typically adds 1-3 minutes to the pipeline at our default scale.
+#
+# To turn the scan OFF: LM_RANK_AUTO = False (default). The static
+# METHOD_PARAMS["optdmdc"]["rank"] / ["coptdmdc"]["rank"] are used.
+# ---------------------------------------------------------------------------
+
+LM_RANK_AUTO            = True
+LM_RANK_AUTO_CANDIDATES = (1, 5, 10, 14, 15, 16, 17, 18, 19, 20, 21, 23, 25, 50, 100, 200, 400)
+LM_RANK_AUTO_PATIENCE   = 2          # consecutive non-improving ranks before stop
+LM_RANK_AUTO_VAL_FRAC   = 0.1        # last 10% of fit window held out for validation
+LM_RANK_AUTO_MIN_IMPROV = 1e-3       # require >0.1% relative improvement to count
 
 
 # ---------------------------------------------------------------------------

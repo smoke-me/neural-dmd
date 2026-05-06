@@ -163,12 +163,19 @@ class EarlyStopper:
     NOT checked here (the LM driver handles them):
         - max_iter cap on outer loop
         - LM divergence / restart cap (gmax)
+
+    Off switch:
+        Setting `tol_rel <= 0` or `patience <= 0` disables the patience
+        criterion entirely - update() then ONLY checks the absolute
+        tolerance, so the loop runs to max_iter unless residual goes
+        below tol_abs. Use this when you want every iteration spent.
     """
 
     def __init__(self, *, tol_abs: float, tol_rel: float, patience: int):
         self.tol_abs = float(tol_abs)
         self.tol_rel = float(tol_rel)
         self.patience = int(patience)
+        self.disabled = (self.tol_rel <= 0.0) or (self.patience <= 0)
         self.best = float("inf")
         self.stalled = 0
         self.reason: str | None = None
@@ -180,6 +187,8 @@ class EarlyStopper:
         if residual < self.tol_abs:
             self.reason = f"abs_tol (residual<{self.tol_abs:.1e})"
             return True
+        if self.disabled:
+            return False
         if self.best == float("inf"):
             self.best = residual
             self.stalled = 0

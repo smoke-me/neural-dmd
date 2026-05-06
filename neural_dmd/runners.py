@@ -161,8 +161,8 @@ def do_plot_loss(method: str) -> None:
     net = MLP(C.ARCH).to(C.DEVICE)
     loss_fn = LOSSES[C.LOSS]
 
-    L_actual = _loss_curve("actual", net, snap["X"], idx, test_loader, loss_fn)
-    L_pred   = _loss_curve(label,   net, X_pred,    idx, test_loader, loss_fn)
+    L_actual = _actual_loss_curve_cached(net, snap, idx, test_loader, loss_fn)
+    L_pred   = _loss_curve(label, net, X_pred, idx, test_loader, loss_fn)
 
     summary = comparison_plot(
         grid_steps, L_actual, L_pred, plot_split,
@@ -205,6 +205,54 @@ def _loss_curve(label, net, X_cols, idx, test_loader, loss_fn):
         out[i - 1] = loss_at(net, X_cols[:, k], test_loader, C.DEVICE, loss_fn)
         progress(f"{label} loss curve", i, len(idx), t, every_pct=25.0)
     return out
+
+
+# Module-level cache for the "actual" loss curve. The actual curve is
+# identical across every method that runs in this experiment (same
+# snapshots, same eval grid, same dataset, same loss function), so we
+# compute it once per (snap, idx, dataset, loss) key and reuse.
+#   - in-memory cache: fast hit when run_full_pipeline iterates methods
+#   - on-disk mirror at <exp_dir>/actual_loss_curve.npz: persists
+#     across separate invocations (e.g. running plot_loss_dmdc.py and
+#     plot_loss_optdmdc.py in two shells)
+_ACTUAL_LOSS_CACHE: dict[tuple, np.ndarray] = {}
+
+
+def _actual_loss_curve_cached(net, snap, idx, test_loader, loss_fn):
+    snap_path = str(E.snapshots_path())
+    key = (snap_path, tuple(int(i) for i in idx), C.DATASET, C.LOSS)
+    if key in _ACTUAL_LOSS_CACHE:
+        log("ok", "actual loss curve: in-memory cache HIT")
+        return _ACTUAL_LOSS_CACHE[key]
+
+    disk_cache = E.exp_dir() / "actual_loss_curve.npz"
+    if disk_cache.exists():
+        try:
+            cached = np.load(disk_cache)
+            cached_idx = cached["idx"]
+            cached_snap = str(cached["snap_path"]) if "snap_path" in cached.files else ""
+            if (cached_snap == snap_path and cached_idx.shape == np.asarray(idx).shape
+                    and np.array_equal(cached_idx, np.asarray(idx))):
+                L = cached["L"]
+                _ACTUAL_LOSS_CACHE[key] = L
+                log("ok", f"actual loss curve: disk cache HIT ({disk_cache.name})")
+                return L
+            log("info",
+                "actual loss curve: disk cache miss (snap_path or idx changed)")
+        except Exception as e:
+            log("warn", f"actual loss curve: disk cache unreadable ({e}); recomputing")
+
+    log("info",
+        "actual loss curve: computing (will be reused for the rest of "
+        "this experiment's plot_loss calls)")
+    L = _loss_curve("actual", net, snap["X"], idx, test_loader, loss_fn)
+    _ACTUAL_LOSS_CACHE[key] = L
+    try:
+        np.savez(disk_cache, L=L, idx=np.asarray(idx), snap_path=snap_path)
+        log("ok", f"actual loss curve: cached to {disk_cache.name}")
+    except Exception as e:
+        log("warn", f"actual loss curve: failed to write disk cache ({e})")
+    return L
 
 
 def do_plot_accuracy(method: str) -> None:
@@ -327,6 +375,20 @@ def run_full_pipeline(methods: list[str] | tuple[str, ...] | None = None,
         raise ValueError(f"unknown ops: {unknown}; valid: {list(_OP_DISPATCH)}")
 
     _log_memory_estimate(methods)
+
+    # Auto rank-selection for OptDMDc / cOptDMDc. Runs a quick held-out
+    # forecast scan over candidate ranks and patches METHOD_PARAMS in
+    # place. Skipped when LM_RANK_AUTO is False or when neither LM-based
+    # method appears in `methods` (saving the scan cost when running
+    # only DMDc / sDMDc).
+    if any(m in methods for m in ("optdmdc", "coptdmdc")) \
+            and "analyze" in ops:
+        try:
+            from .rank_scan import auto_select_lm_rank
+            auto_select_lm_rank()
+        except Exception as e:
+            log("warn", f"runners: rank scan failed ({e}); falling back to "
+                        "configured METHOD_PARAMS rank")
 
     try:
         for method in methods:
