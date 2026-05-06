@@ -36,6 +36,7 @@ import time
 
 import numpy as np
 
+from . import config as C
 from .dmdc import _kernel
 from .log import log
 
@@ -141,15 +142,74 @@ def _solve_lm_unconstrained(J, rho, nu, scales):
 
 
 # ---------------------------------------------------------------------------
+# early stopping for the LM loop
+# ---------------------------------------------------------------------------
+
+class EarlyStopper:
+    """Decide when the LM iteration has done enough.
+
+    A pure book-keeper: feed it accepted residuals via update() and it
+    returns True the first time a stop criterion fires. The reason is
+    exposed via .reason for logging + metrics.
+
+    Stop criteria checked in order:
+        1. absolute     - residual < tol_abs
+        2. patience     - relative improvement (best - now)/best < tol_rel
+                           for `patience` consecutive accepted iterations.
+                          Catches the "LM is now chasing noise" regime
+                          where in-fit residual still drops slowly but
+                          the marginal improvement is meaningless.
+
+    NOT checked here (the LM driver handles them):
+        - max_iter cap on outer loop
+        - LM divergence / restart cap (gmax)
+    """
+
+    def __init__(self, *, tol_abs: float, tol_rel: float, patience: int):
+        self.tol_abs = float(tol_abs)
+        self.tol_rel = float(tol_rel)
+        self.patience = int(patience)
+        self.best = float("inf")
+        self.stalled = 0
+        self.reason: str | None = None
+        self.iters_seen = 0
+
+    def update(self, residual: float) -> bool:
+        """Feed an accepted residual. Returns True if we should stop now."""
+        self.iters_seen += 1
+        if residual < self.tol_abs:
+            self.reason = f"abs_tol (residual<{self.tol_abs:.1e})"
+            return True
+        if self.best == float("inf"):
+            self.best = residual
+            self.stalled = 0
+            return False
+        rel_drop = (self.best - residual) / max(self.best, 1e-30)
+        if rel_drop >= self.tol_rel:
+            self.best = residual
+            self.stalled = 0
+        else:
+            self.stalled += 1
+            if self.stalled >= self.patience:
+                self.reason = (
+                    f"patience ({self.patience} iters with "
+                    f"<{self.tol_rel:.1e} relative improvement)")
+                return True
+        return False
+
+
+# ---------------------------------------------------------------------------
 # public API
 # ---------------------------------------------------------------------------
 
 def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
         max_iter: int = 50, tol: float = 1e-6, gmax: int = 50,
         incr: float = 1.5, decr: float = 2.0, nu0: float = 2.0,
-        dt: float = 1.0) -> dict:
-    X = snap["X"].astype(np.float64, copy=False)
-    U = snap["U"].astype(np.float64, copy=False)
+        dt: float = 1.0,
+        tol_rel: float = 1e-3, patience: int = 3) -> dict:
+    dtype = np.dtype(C.PRECISION)
+    X = snap["X"].astype(dtype, copy=False)
+    U = snap["U"].astype(dtype, copy=False)
     steps = snap["steps"]
     fit_split     = int(snap["fit_split"])
     fit_start_idx = int(snap.get("fit_start_idx", 0))
@@ -179,15 +239,19 @@ def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
         f"lm_rank={p}  pod_rank={pp}  F0={F0.shape}  G={G.shape}")
 
     # ----- 2. eigendecomposition + initial gamma -----
+    # The reduced operator F0 is small (p x p, p <= ~500) and the
+    # eigendecomposition / log / exp chain is sensitive to precision -
+    # promote to complex128 here even when the bulk arrays are f32.
     log("info", "OptDMDc: stage 2/4  eigendecomposition + initial gamma")
     t = time.time()
-    mu, Z = np.linalg.eig(F0)                                    # F0 = Z diag(mu) Z^-1
+    F0_c = F0.astype(np.complex128, copy=False)
+    mu, Z = np.linalg.eig(F0_c)                                  # F0 = Z diag(mu) Z^-1
     Z_inv = np.linalg.inv(Z)
-    H0 = Ux.T @ X_fit[:, :-1]                                    # (p, m_fit-1)
-    H0_T = H0.T.astype(complex, copy=True)                       # (m_fit-1, p)
-    alpha     = Z_inv @ H0[:, 0]                                 # (p,)
-    beta_star = Z_inv @ G                                        # (p, q)
-    gamma = np.log(mu).astype(complex) / dt
+    H0 = Ux.T @ X_fit[:, :-1]                                    # (p, m_fit-1) in PRECISION
+    H0_T = H0.T.astype(np.complex128, copy=True)                 # (m_fit-1, p)
+    alpha     = Z_inv @ H0[:, 0].astype(np.complex128)           # (p,)
+    beta_star = Z_inv @ G.astype(np.complex128)                  # (p, q)
+    gamma = np.log(mu) / dt                                      # already complex128
     log("ok",
         f"OptDMDc: stage 2/4  eig done in {time.time() - t:.2f}s  "
         f"spectral_radius={np.max(np.abs(mu)):.6f}  "
@@ -196,7 +260,8 @@ def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
     # ----- 3. variable-projection LM (unconstrained) -----
     log("info",
         f"OptDMDc: stage 3/4  variable-projection LM  "
-        f"max_iter={max_iter}  tol={tol}  nu0={nu0}  incr={incr}  decr={decr}  "
+        f"max_iter={max_iter}  tol={tol}  tol_rel={tol_rel:.1e}  "
+        f"patience={patience}  nu0={nu0}  incr={incr}  decr={decr}  "
         f"gmax={gmax}")
     t1 = time.time()
 
@@ -210,13 +275,18 @@ def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
     Psi, dPsi, Up, sp, Vhp, Omega, R = fit(gamma)
     rho = R.reshape(-1)
     res_norm = np.linalg.norm(rho)
+    res_initial = res_norm
     log("info",
         f"OptDMDc: iter   0  residual={res_norm:.6e}  "
         f"Psi={Psi.shape}  Omega={Omega.shape}")
 
+    stopper = EarlyStopper(tol_abs=tol, tol_rel=tol_rel, patience=patience)
+    stop_reason = "max_iter"
     nu = nu0
     restarts = 0
+    iters_done = 0
     for it in range(1, max_iter + 1):
+        iters_done = it
         J = _jacobian_columns(Psi, dPsi, Up, sp, Vhp, Omega, R, p)
         scales = np.linalg.norm(J, axis=0).real
 
@@ -235,6 +305,7 @@ def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
                 f"nu={nu:.3e}  restarts={restarts}/{gmax}")
             if restarts > gmax:
                 log("warn", "OptDMDc: gmax exceeded, stopping LM loop")
+                stop_reason = f"gmax exceeded ({restarts}>{gmax})"
                 break
             continue
         gamma, Psi, dPsi, Up, sp, Vhp, Omega, R, rho, res_norm = (
@@ -246,13 +317,14 @@ def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
         if restarts == 0:
             nu = nu / decr
         restarts = 0
-        if res_norm < tol:
-            log("ok", f"OptDMDc: converged at iter {it} (residual<{tol:.1e})")
+        if stopper.update(res_norm):
+            log("ok", f"OptDMDc: early-stopped at iter {it} - {stopper.reason}")
+            stop_reason = stopper.reason
             break
 
     log("ok",
         f"OptDMDc: stage 3/4  LM done in {time.time() - t1:.2f}s  "
-        f"final_residual={res_norm:.6e}")
+        f"final_residual={res_norm:.6e}  stop={stop_reason}")
 
     # ----- 4. reduced operator + forecast -----
     log("info", "OptDMDc: stage 4/4  assembling F_new + in-sample lift + forecast")
@@ -300,10 +372,14 @@ def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
         f"OptDMDc: forecast iterated {iters} steps, sampled "
         f"{target_idx} predictions in {time.time() - tF:.2f}s")
 
-    return {"X_pred":      X_pred.astype(np.float32, copy=False),
-            "A":           F_new,
-            "eigenvalues": mu_new,
-            "gamma":       gamma,
-            "rank":        p,
-            "pod_rank":    pp,
-            "fit_split":   fit_split}
+    return {"X_pred":             X_pred.astype(np.float32, copy=False),
+            "A":                  F_new,
+            "eigenvalues":        mu_new,
+            "gamma":              gamma,
+            "rank":               p,
+            "pod_rank":           pp,
+            "fit_split":          fit_split,
+            "lm_initial_residual": float(res_initial),
+            "lm_final_residual":   float(res_norm),
+            "lm_iters":           iters_done,
+            "lm_stop_reason":     stop_reason}

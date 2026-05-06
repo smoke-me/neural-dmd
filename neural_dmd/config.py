@@ -112,6 +112,21 @@ SNAP_FORECAST_EVERY = 50
 FIT_FRAC  = 0.5
 FIT_RANGE = None
 
+# Inject zero-mean Gaussian noise into every recorded parameter
+# snapshot, simulating a noisy "measurement" of the underlying clean
+# trajectory. NOISE_SIGMA is RELATIVE to the global trajectory std, so:
+#
+#   NOISE_SIGMA = 0.0    clean (default)
+#   NOISE_SIGMA = 1e-3   ~paper-faithful (Rains et al. 2024 §3.1 noise study)
+#   NOISE_SIGMA = 1e-2   heavy noise; lets cOpt's de-biasing shine vs DMDc
+#
+# Seeded deterministically from SEED so a given (training config,
+# NOISE_SIGMA) pair always produces byte-identical noisy snapshots.
+# Participates in the data_hash, so each noise level gets its own
+# outputs/data/<hash>/ cache and you can sweep noise levels by changing
+# this knob alone (no other config edits needed).
+NOISE_SIGMA = 0.0
+
 # ---------------------------------------------------------------------------
 # METHOD PARAMS
 #
@@ -132,6 +147,13 @@ METHOD_PARAMS: dict[str, dict] = {
                  "pod_rank": None,
                  "max_iter": 50,
                  "tol":      1e-6,
+                 # Early-stopping: quit when residual has improved by
+                 # less than `tol_rel` for `patience` consecutive
+                 # accepted LM iterations. Catches the regime where LM
+                 # is no longer fitting signal and starting to overfit
+                 # in-fit noise (which destroys forecast quality).
+                 "tol_rel":  1e-3,
+                 "patience": 3,
                  "gmax":     50,
                  "incr":     1.5,
                  "decr":     2.0,
@@ -141,6 +163,8 @@ METHOD_PARAMS: dict[str, dict] = {
                  "pod_rank": None,
                  "max_iter": 50,
                  "tol":      1e-6,
+                 "tol_rel":  1e-3,
+                 "patience": 3,
                  "gmax":     50,
                  "incr":     1.5,
                  "decr":     2.0,
@@ -159,6 +183,29 @@ METHOD_PARAMS: dict[str, dict] = {
 # so a strict "> 1" check classifies on-circle eigenvalues as unstable.
 # Anything within tol of the unit circle is treated as stable.
 EIG_STABLE_TOL = 1e-12
+
+
+# ---------------------------------------------------------------------------
+# PRECISION (memory budget)
+#
+# All large arrays (X, U, SVD outputs, Jacobian) are kept in this dtype.
+# Small per-operator pieces (eigendecomposition of F, gamma vector,
+# alpha/beta_star) stay in f64 so the eigenvalue / log / exp chain
+# doesn't lose precision on the small p x p matrices.
+#
+#   "float32"  ~6-8 GB peak at the default 50-epoch baseline; runs on
+#              16-32 GB machines with room to spare.  (default)
+#   "float64"  ~13-15 GB peak; needs 32+ GB.  Use only when you've
+#              observed numerical issues that f32 cannot resolve.
+#
+# Memory savings come from:
+#   X snapshots cast in-place (half the size, no copy)
+#   sgesdd vs dgesdd in numpy.linalg.svd (~half workspace + outputs)
+#   smaller cached SVDs (Ux_full, Uo_full)
+#   smaller Jacobian in OptDMDc / cOptDMDc (also halves rank^2 cost)
+# ---------------------------------------------------------------------------
+
+PRECISION = "float32"
 
 
 # ---------------------------------------------------------------------------

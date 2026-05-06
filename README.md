@@ -70,7 +70,7 @@ config>)`. The exact fields hashed live in
 DATASET, ARCH, EPOCHS, BATCH_SIZE, LR, LR_MIN, LOSS,
 FIT_FRAC, FIT_RANGE,
 SNAP_FIT_EVERY, SNAP_FORECAST_EVERY,
-SEED,
+SEED, NOISE_SIGMA,
 + source code of control_fn
 ```
 
@@ -158,11 +158,15 @@ METHOD_PARAMS = {
     "dmdc":     {"rank": None},
     "sdmdc":    {"rank": None, "dt": float(SNAP_FIT_EVERY)},
     "optdmdc":  {"rank": 50, "pod_rank": None,
-                 "max_iter": 50, "tol": 1e-6, "gmax": 50,
+                 "max_iter": 50, "tol": 1e-6,
+                 "tol_rel": 1e-3, "patience": 3,
+                 "gmax": 50,
                  "incr": 1.5, "decr": 2.0, "nu0": 2.0,
                  "dt":  float(SNAP_FIT_EVERY)},
     "coptdmdc": {"rank": 50, "pod_rank": None,
-                 "max_iter": 50, "tol": 1e-6, "gmax": 50,
+                 "max_iter": 50, "tol": 1e-6,
+                 "tol_rel": 1e-3, "patience": 3,
+                 "gmax": 50,
                  "incr": 1.5, "decr": 2.0, "nu0": 2.0,
                  "dt":  float(SNAP_FIT_EVERY)},
 }
@@ -173,6 +177,63 @@ scales like `~16 * (m_fit-1) * rank^2` bytes). `pod_rank` is decoupled
 and only governs the in-sample reconstruction lift, so the in-fit
 accuracy plot can show ~100% even when the dynamics live in a small
 subspace.
+
+### LM early stopping (Opt / cOpt)
+
+Both `optdmdc.run` and `coptdmdc.run` halt the Levenberg-Marquardt
+iteration as soon as one of these fires:
+
+| Criterion | Condition | Knob |
+|-----------|-----------|------|
+| Absolute  | residual < `tol`                             | `tol`      |
+| Patience  | relative improvement `(best − now)/best < tol_rel` for `patience` consecutive accepted iters | `tol_rel`, `patience` |
+| Hard cap  | iteration count = `max_iter`                 | `max_iter` |
+| Divergence | LM restart count > `gmax`                   | `gmax`     |
+
+**Why patience?** At low LM rank (e.g. 50) on a richer trajectory, LM
+keeps lowering the in-fit residual past the point of fitting signal;
+those late iterations chase in-window noise that doesn't generalise to
+the forecast region. The patience criterion stops once per-iter
+improvement falls below `tol_rel`, capturing the model just before it
+starts overfitting. The `lm_stop_reason` field in `metrics.json` (and
+the `LM stop` column in `summary.html`) records which criterion fired.
+
+Defaults `tol_rel = 1e-3, patience = 3` mean: "stop when the residual
+hasn't dropped by 0.1% per iter for 3 iters in a row". Tighter
+(`tol_rel = 1e-4, patience = 5`) lets LM run longer; looser
+(`tol_rel = 5e-3, patience = 1`) stops sooner.
+
+### Snapshot noise (`NOISE_SIGMA`)
+
+```python
+NOISE_SIGMA = 0.0       # clean (default)
+NOISE_SIGMA = 1e-3      # paper-faithful (Rains et al. 2024 §3.1)
+NOISE_SIGMA = 1e-2      # heavy noise; cOpt's de-biasing should beat DMDc here
+```
+
+When `NOISE_SIGMA > 0`, every recorded parameter snapshot has zero-mean
+Gaussian noise added before `snapshots.npz` is written. The standard
+deviation is interpreted **relative to the global trajectory std**:
+
+```
+sigma_abs = NOISE_SIGMA * std(X_full)
+```
+
+so the level scales sensibly across architectures / convergence stages.
+Seeded deterministically from `SEED` so the same `(training config,
+NOISE_SIGMA)` pair always produces byte-identical noisy snapshots.
+
+`NOISE_SIGMA` is in `TRAIN_FIELDS`, so each value gets its own
+`outputs/data/<hash>/` cache. To sweep noise levels, edit just this
+knob and run `scripts/run_exp.py` — it'll retrain and produce a new
+experiment dir per noise level, side-by-side.
+
+This is the canonical knob to enable when you want to test whether
+**OptDMDc / cOptDMDc actually beat DMDc**. Plain DMDc fits noise as
+spurious eigenvalues; OptDMDc's variable-projection LSQ is provably
+less biased on noisy data; cOpt additionally constrains the spurious
+modes inside the unit circle. The differences are dramatic when noise
+is large enough to corrupt DMDc but invisible when data is clean.
 
 ### Fit-window selection (`FIT_RANGE`)
 
@@ -218,8 +279,11 @@ as base64 data URLs so the file is portable). Sections in order:
    data hash, list of methods that ran.
 2. **Metrics** table — one row per method, columns:
    `Rank | POD rank | Spectral ρ | λ>1 | In Δacc% | Out Δacc% | In Δloss
-   | Out Δloss | Wall (s)`.
+   | Out Δloss | LM iters | LM stop | Wall (s)`.
    Cells with `λ>1 > 0` or NaN are highlighted red; `λ>1 = 0` green.
+   `LM iters` + `LM stop` show how many Levenberg-Marquardt iterations
+   actually ran (vs `max_iter`) and which stop criterion fired
+   (`abs_tol`, `patience`, `max_iter`, `gmax exceeded`).
 3. **Forecast-region final / min** table — `actual final L | pred final
    L | actual min L | pred min L | actual final acc% | pred final acc%`
    (only when loss plots ran).
@@ -406,7 +470,8 @@ on the test set.
 
 ### Forecast-region final / min table
 
-For methods where loss/accuracy plots ran, the second table reports:
+When the loss plot ran, this second table compares predicted vs actual
+test loss in the forecast window:
 
 | Column            | Meaning                                                          |
 |-------------------|------------------------------------------------------------------|
@@ -414,14 +479,18 @@ For methods where loss/accuracy plots ran, the second table reports:
 | pred final L      | predicted network's loss at the same point                       |
 | actual min L      | minimum of true network's loss over the forecast window          |
 | pred min L        | minimum of predicted network's loss over the forecast window     |
-| actual final acc% | true network's downstream test METRIC at the last forecast point |
-| pred final acc%   | predicted network's downstream test METRIC at the same point     |
 
 `pred final L` close to `actual final L` = the forecast lands at the
 right loss. `pred min L` ≪ `actual min L` = the forecast undershoots
 (predicts an unrealistically good model at some point, often a
-diverging-mode artefact). `pred final acc%` close to `actual final
-acc%` = the forecast preserves the converged network's test performance.
+diverging-mode artefact).
+
+The metric we care about for forecasting quality is **parameter
+prediction accuracy** (the accuracy plot's y-axis) — how close the
+predicted weight vector is to the actual weight vector in L2. The
+network's downstream test accuracy is *not* tracked separately; the
+`out Δloss` column already captures whether the predicted weights make
+a sensible network.
 
 ---
 

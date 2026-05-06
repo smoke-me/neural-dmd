@@ -3,13 +3,17 @@ DMDc fit + forecast (Proctor-Brunton-Kutz, SIAM J. Appl. Dyn. Syst. 2016,
 augmented with full-X output basis so in-sample reconstruction is exact
 at full rank).
 
-Inputs are cast to f64 internally so the SVD is numerically faithful;
-the returned X_pred is cast back to f32 to match the snapshot NPZ schema.
+All big arrays (X, U, SVD outputs) are kept in config.PRECISION dtype
+(default float32) - sgesdd is ~2x faster + uses ~half the memory of
+dgesdd. The returned X_pred matches snapshot NPZ schema (float32).
+Small per-operator pieces (the reduced operator F itself) stay in the
+same precision; eigendecompositions in opt/copt cast a copy of F to
+complex128 for the small p x p step where precision matters most.
 
 Public surface:
     run(snap: dict, *, rank: int | None) -> dict
-        Returns {'X_pred': (n, m) f32, 'A': (p, p) f64, 'rank': int,
-                 'fit_split': int}.
+        Returns {'X_pred': (n, m) f32, 'A': (p, p) <PRECISION>,
+                 'rank': int, 'fit_split': int}.
 
 Module-private (also imported by optdmdc.py / coptdmdc.py):
     _kernel(X_fit, U_fit, *, rank, n, q, m_fit) -> dict
@@ -31,6 +35,7 @@ import time
 
 import numpy as np
 
+from . import config as C
 from .log import log, log_spectrum, progress
 
 
@@ -159,11 +164,11 @@ def _kernel_cache_clear() -> None:
 
 
 def run(snap: dict, *, rank: int | None = None) -> dict:
-    # We cast the snapshot data to f64 internally so the SVD is
-    # numerically faithful. The output X_pred is cast back to f32 at the
-    # end so the npz schema downstream stays unchanged.
-    X = snap["X"].astype(np.float64, copy=False)              # (n, m)
-    U = snap["U"].astype(np.float64, copy=False)              # (q, total_steps - 1)
+    # All big arrays kept in C.PRECISION (default f32). The output
+    # X_pred is cast to f32 at the end to match the snapshot NPZ schema.
+    dtype = np.dtype(C.PRECISION)
+    X = snap["X"].astype(dtype, copy=False)                   # (n, m)
+    U = snap["U"].astype(dtype, copy=False)                   # (q, total_steps - 1)
     steps = snap["steps"]                                     # (m,)
     fit_split     = int(snap["fit_split"])                    # first snap idx OUTSIDE fit window
     fit_start_idx = int(snap.get("fit_start_idx", 0))         # first snap idx INSIDE fit window

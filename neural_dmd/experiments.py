@@ -105,6 +105,7 @@ TRAIN_FIELDS = (
     "SNAP_FIT_EVERY",
     "SNAP_FORECAST_EVERY",
     "SEED",
+    "NOISE_SIGMA",
 )
 
 _EXP_ID_ENV = "NEURAL_DMD_EXP_ID"
@@ -514,6 +515,8 @@ _SUMMARY_KEYS = [
     ("out_sample_dacc_pct", "Out Δacc%"),
     ("in_sample_dloss",     "In Δloss"),
     ("out_sample_dloss",    "Out Δloss"),
+    ("lm_iters",            "LM iters"),
+    ("lm_stop_reason",      "LM stop"),
     ("wall_seconds",        "Wall (s)"),
 ]
 
@@ -522,8 +525,6 @@ _FORECAST_KEYS = [
     ("forecast_loss_pred_final",   "pred final L"),
     ("forecast_loss_actual_min",   "actual min L"),
     ("forecast_loss_pred_min",     "pred min L"),
-    ("forecast_acc_actual_final",  "actual final acc%"),
-    ("forecast_acc_pred_final",    "pred final acc%"),
 ]
 
 

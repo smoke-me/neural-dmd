@@ -94,7 +94,7 @@ def do_analyze(method: str) -> None:
         metrics["pod_rank"] = int(out["pod_rank"])
     # convergence stats: methods may attach lm_* keys to their return
     for k in ("lm_initial_residual", "lm_final_residual",
-              "lm_iters", "lm_restarts"):
+              "lm_iters", "lm_restarts", "lm_stop_reason"):
         if k in out:
             metrics[k] = out[k]
     if has_lm and "lm_initial_residual" not in metrics:
@@ -129,7 +129,7 @@ def do_plot_loss(method: str) -> None:
     # accuracy plots fast even on machines without CUDA-ready torch.
     import torch  # noqa: F401
     from .data import get_loaders
-    from .metrics import LOSSES, METRICS, loss_at, metric_at
+    from .metrics import LOSSES, loss_at
     from .model import MLP
 
     info  = get_method(method)
@@ -164,14 +164,6 @@ def do_plot_loss(method: str) -> None:
     L_actual = _loss_curve("actual", net, snap["X"], idx, test_loader, loss_fn)
     L_pred   = _loss_curve(label,   net, X_pred,    idx, test_loader, loss_fn)
 
-    # Downstream test-METRIC (default = test accuracy) of the network at
-    # each predicted parameter vector. This is the "true" test accuracy
-    # comparison, distinct from the parameter L2 prediction accuracy
-    # plotted by do_plot_accuracy.
-    metric_fn = METRICS[C.METRIC]
-    A_actual = _metric_curve("actual", net, snap["X"], idx, test_loader, metric_fn)
-    A_pred   = _metric_curve(label,    net, X_pred,    idx, test_loader, metric_fn)
-
     summary = comparison_plot(
         grid_steps, L_actual, L_pred, plot_split,
         fit_start_idx=fit_start_grid,
@@ -196,15 +188,11 @@ def do_plot_loss(method: str) -> None:
     if plot_split < len(idx):
         L_act_fc = L_actual[plot_split:]
         L_prd_fc = L_pred[plot_split:]
-        A_act_fc = A_actual[plot_split:]
-        A_prd_fc = A_pred[plot_split:]
         metrics_payload.update({
             "forecast_loss_actual_final": float(L_act_fc[-1]),
             "forecast_loss_pred_final":   float(L_prd_fc[-1]),
             "forecast_loss_actual_min":   float(L_act_fc.min()),
             "forecast_loss_pred_min":     float(L_prd_fc.min()),
-            "forecast_acc_actual_final":  float(A_act_fc[-1] * 100.0),
-            "forecast_acc_pred_final":    float(A_prd_fc[-1] * 100.0),
         })
     E.write_metrics_bulk(method, metrics_payload)
 
@@ -216,16 +204,6 @@ def _loss_curve(label, net, X_cols, idx, test_loader, loss_fn):
     for i, k in enumerate(idx, start=1):
         out[i - 1] = loss_at(net, X_cols[:, k], test_loader, C.DEVICE, loss_fn)
         progress(f"{label} loss curve", i, len(idx), t, every_pct=25.0)
-    return out
-
-
-def _metric_curve(label, net, X_cols, idx, test_loader, metric_fn):
-    from .metrics import metric_at
-    t = time.time()
-    out = np.empty(len(idx), dtype=np.float64)
-    for i, k in enumerate(idx, start=1):
-        out[i - 1] = metric_at(net, X_cols[:, k], test_loader, C.DEVICE, metric_fn)
-        progress(f"{label} metric curve", i, len(idx), t, every_pct=25.0)
     return out
 
 
@@ -347,7 +325,65 @@ def run_full_pipeline(methods: list[str] | tuple[str, ...] | None = None,
     unknown = [o for o in ops if o not in _OP_DISPATCH]
     if unknown:
         raise ValueError(f"unknown ops: {unknown}; valid: {list(_OP_DISPATCH)}")
-    for method in methods:
-        banner(f"=== METHOD: {method}", ops=",".join(ops))
-        for op in ops:
-            _OP_DISPATCH[op](method)
+
+    _log_memory_estimate(methods)
+
+    try:
+        for method in methods:
+            banner(f"=== METHOD: {method}", ops=",".join(ops))
+            for op in ops:
+                _OP_DISPATCH[op](method)
+    finally:
+        # Evict the SVD cache so the persistent ~1-3 GB doesn't linger
+        # past the end of the pipeline when the user re-uses the same
+        # process for plotting / inspection.
+        from .dmdc import _kernel_cache_clear, _SVD_CACHE
+        if _SVD_CACHE:
+            log("info",
+                f"runners: clearing kernel SVD cache ({len(_SVD_CACHE)} entries) "
+                f"to free memory")
+            _kernel_cache_clear()
+
+
+def _log_memory_estimate(methods) -> None:
+    """Quick rough estimate of peak RAM the pipeline will consume + a
+    psutil read of what's currently free. Helps users on smaller boxes
+    spot the OOM risk before the SVD blows up."""
+    try:
+        from .snapshots import Recorder
+        from . import experiments as E
+        snap_path = E.snapshots_path()
+        if not snap_path.exists():
+            return
+        snap = Recorder.load(snap_path)
+        n, m = snap["X"].shape
+        fit_split     = int(snap["fit_split"])
+        fit_start_idx = int(snap.get("fit_start_idx", 0))
+        m_fit = max(fit_split - fit_start_idx, 1)
+        bytes_per = np.dtype(C.PRECISION).itemsize
+        # Two SVDs (Omega + X_fit), each holds full Ux ~ n * m_fit + workspace
+        svd_persistent = 2 * n * m_fit * bytes_per
+        svd_peak_workspace = 2 * n * m_fit * bytes_per
+        snap_in_mem = n * m * bytes_per
+        rough_peak = (svd_persistent + svd_peak_workspace + snap_in_mem) / 1e9
+
+        log("info",
+            f"runners: rough peak RAM estimate at {C.PRECISION} = "
+            f"{rough_peak:.1f} GB  (n={n} m_fit={m_fit} m_total={m})")
+
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            log("info",
+                f"runners: system memory  total={vm.total / 1e9:.1f} GB  "
+                f"available={vm.available / 1e9:.1f} GB  used%={vm.percent:.0f}")
+            if vm.available < rough_peak * 1.3 * 1e9:
+                log("warn",
+                    f"runners: estimated peak ({rough_peak:.1f} GB) is close "
+                    f"to or exceeds available memory ({vm.available / 1e9:.1f} "
+                    f"GB). Consider PRECISION='float32' (already set) or "
+                    f"smaller EPOCHS / FIT_RANGE.")
+        except ImportError:
+            pass
+    except Exception as e:
+        log("warn", f"runners: memory estimate skipped ({e})")

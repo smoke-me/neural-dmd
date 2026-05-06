@@ -33,7 +33,7 @@ from neural_dmd.log import banner, log, progress
 from neural_dmd.metrics import LOSSES
 from neural_dmd.model import MLP
 from neural_dmd.schedule import cosine, current_lr
-from neural_dmd.snapshots import Recorder
+from neural_dmd.snapshots import Recorder, inject_snapshot_noise
 
 
 def train_epoch(model, loader, opt, sched, recorder, loss_fn, *,
@@ -174,6 +174,13 @@ def main():
 
     torch.save(model.state_dict(), E.model_path())
     log("info", f"saved weights to {E.model_path()}")
+
+    # Optionally inject Gaussian noise into the recorded snapshots
+    # before saving. Seeded off SEED + a fixed offset so noise is
+    # reproducible and decoupled from the training RNG stream.
+    inject_snapshot_noise(recorder.X,
+                          sigma_rel=float(getattr(C, "NOISE_SIGMA", 0.0)),
+                          seed=seed + 12345)
 
     recorder.save(E.snapshots_path())
     log("ok",

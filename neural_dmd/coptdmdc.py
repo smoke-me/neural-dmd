@@ -40,10 +40,11 @@ import time
 import numpy as np
 from scipy.optimize import lsq_linear
 
+from . import config as C
 from .dmdc import _kernel
 from .log import log
-from .optdmdc import (_build_psi_and_dpsi, _jacobian_columns,
-                      _real_block_pack)
+from .optdmdc import (EarlyStopper, _build_psi_and_dpsi,
+                      _jacobian_columns, _real_block_pack)
 
 
 def _radial_project(gamma):
@@ -72,9 +73,11 @@ def _solve_lm_constrained(J, rho, gamma, nu, scales):
 def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
         max_iter: int = 50, tol: float = 1e-6, gmax: int = 50,
         incr: float = 1.5, decr: float = 2.0, nu0: float = 2.0,
-        dt: float = 1.0) -> dict:
-    X = snap["X"].astype(np.float64, copy=False)
-    U = snap["U"].astype(np.float64, copy=False)
+        dt: float = 1.0,
+        tol_rel: float = 1e-3, patience: int = 3) -> dict:
+    dtype = np.dtype(C.PRECISION)
+    X = snap["X"].astype(dtype, copy=False)
+    U = snap["U"].astype(dtype, copy=False)
     steps = snap["steps"]
     fit_split     = int(snap["fit_split"])
     fit_start_idx = int(snap.get("fit_start_idx", 0))
@@ -104,16 +107,19 @@ def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
         f"lm_rank={p}  pod_rank={pp}  F0={F0.shape}  G={G.shape}")
 
     # ----- 2. eigendecomposition + initial radial projection -----
+    # F0 is small (p x p); promote to complex128 so eig/log/exp stay
+    # at full precision even when bulk arrays are f32.
     log("info", "cOptDMDc: stage 2/4  eigendecomposition + radial projection")
     t = time.time()
-    mu, Z = np.linalg.eig(F0)
+    F0_c = F0.astype(np.complex128, copy=False)
+    mu, Z = np.linalg.eig(F0_c)
     Z_inv = np.linalg.inv(Z)
     H0 = Ux.T @ X_fit[:, :-1]
-    H0_T = H0.T.astype(complex, copy=True)
-    alpha     = Z_inv @ H0[:, 0]
-    beta_star = Z_inv @ G
+    H0_T = H0.T.astype(np.complex128, copy=True)
+    alpha     = Z_inv @ H0[:, 0].astype(np.complex128)
+    beta_star = Z_inv @ G.astype(np.complex128)
 
-    gamma_raw = np.log(mu).astype(complex) / dt
+    gamma_raw = np.log(mu) / dt
     n_unstable = int((gamma_raw.real > 0).sum())
     gamma = _radial_project(gamma_raw)
     log("ok",
@@ -125,7 +131,8 @@ def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
     # ----- 3. variable-projection LM (constrained Re(gamma) <= 0) -----
     log("info",
         f"cOptDMDc: stage 3/4  constrained LM  "
-        f"max_iter={max_iter}  tol={tol}  nu0={nu0}  incr={incr}  decr={decr}  "
+        f"max_iter={max_iter}  tol={tol}  tol_rel={tol_rel:.1e}  "
+        f"patience={patience}  nu0={nu0}  incr={incr}  decr={decr}  "
         f"gmax={gmax}")
     t1 = time.time()
 
@@ -139,13 +146,18 @@ def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
     Psi, dPsi, Up, sp, Vhp, Omega, R = fit(gamma)
     rho = R.reshape(-1)
     res_norm = np.linalg.norm(rho)
+    res_initial = res_norm
     log("info",
         f"cOptDMDc: iter   0  residual={res_norm:.6e}  "
         f"Psi={Psi.shape}  Omega={Omega.shape}")
 
+    stopper = EarlyStopper(tol_abs=tol, tol_rel=tol_rel, patience=patience)
+    stop_reason = "max_iter"
     nu = nu0
     restarts = 0
+    iters_done = 0
     for it in range(1, max_iter + 1):
+        iters_done = it
         J = _jacobian_columns(Psi, dPsi, Up, sp, Vhp, Omega, R, p)
         scales = np.linalg.norm(J, axis=0).real
 
@@ -167,6 +179,7 @@ def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
                 f"nu={nu:.3e}  restarts={restarts}/{gmax}")
             if restarts > gmax:
                 log("warn", "cOptDMDc: gmax exceeded, stopping LM loop")
+                stop_reason = f"gmax exceeded ({restarts}>{gmax})"
                 break
             continue
         gamma, Psi, dPsi, Up, sp, Vhp, Omega, R, rho, res_norm = (
@@ -179,13 +192,14 @@ def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
         if restarts == 0:
             nu = nu / decr
         restarts = 0
-        if res_norm < tol:
-            log("ok", f"cOptDMDc: converged at iter {it} (residual<{tol:.1e})")
+        if stopper.update(res_norm):
+            log("ok", f"cOptDMDc: early-stopped at iter {it} - {stopper.reason}")
+            stop_reason = stopper.reason
             break
 
     log("ok",
         f"cOptDMDc: stage 3/4  LM done in {time.time() - t1:.2f}s  "
-        f"final_residual={res_norm:.6e}")
+        f"final_residual={res_norm:.6e}  stop={stop_reason}")
 
     # ----- 4. reduced operator + forecast -----
     log("info", "cOptDMDc: stage 4/4  assembling F_new + in-sample lift + forecast")
@@ -225,10 +239,14 @@ def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
         f"cOptDMDc: forecast iterated {iters} steps, sampled "
         f"{target_idx} predictions in {time.time() - tF:.2f}s")
 
-    return {"X_pred":      X_pred.astype(np.float32, copy=False),
-            "A":           F_new,
-            "eigenvalues": mu_new,
-            "gamma":       gamma,
-            "rank":        p,
-            "pod_rank":    pp,
-            "fit_split":   fit_split}
+    return {"X_pred":             X_pred.astype(np.float32, copy=False),
+            "A":                  F_new,
+            "eigenvalues":        mu_new,
+            "gamma":              gamma,
+            "rank":               p,
+            "pod_rank":           pp,
+            "fit_split":          fit_split,
+            "lm_initial_residual": float(res_initial),
+            "lm_final_residual":   float(res_norm),
+            "lm_iters":           iters_done,
+            "lm_stop_reason":     stop_reason}

@@ -32,14 +32,16 @@ import time
 
 import numpy as np
 
+from . import config as C
 from .coptdmdc import _radial_project        # reuse the same one-line clip
 from .dmdc import _kernel
 from .log import log, progress
 
 
 def run(snap: dict, *, rank: int | None = None, dt: float = 1.0) -> dict:
-    X = snap["X"].astype(np.float64, copy=False)
-    U = snap["U"].astype(np.float64, copy=False)
+    dtype = np.dtype(C.PRECISION)
+    X = snap["X"].astype(dtype, copy=False)
+    U = snap["U"].astype(dtype, copy=False)
     steps = snap["steps"]
     fit_split     = int(snap["fit_split"])
     fit_start_idx = int(snap.get("fit_start_idx", 0))

@@ -34,6 +34,7 @@ for every step in the forecast region too.
 
 import numpy as np
 
+from .log import log
 from .params import flatten_params
 
 
@@ -43,6 +44,40 @@ def eval_indices(steps: np.ndarray, every: int) -> np.ndarray:
     # the dense fit-region snapshots down to the same per-N grid as the
     # forecast region.
     return np.where(steps % every == 0)[0]
+
+
+def inject_snapshot_noise(X_list: list[np.ndarray],
+                          sigma_rel: float,
+                          seed: int) -> None:
+    """Add zero-mean Gaussian noise to each recorded parameter snapshot
+    in place.
+
+    `sigma_rel` is interpreted RELATIVE to the global trajectory's
+    standard deviation, so the noise level scales with the parameter
+    distribution and gives meaningful comparisons across architectures
+    / training-stage choices:
+
+        sigma_abs = sigma_rel * std(X_full)
+
+    `seed` makes the noise reproducible: same training data + same
+    sigma_rel + same seed => byte-identical snapshots.
+
+    No-op when sigma_rel <= 0. Mutates X_list (each entry replaced with
+    its noised counterpart) so downstream save() picks it up.
+    """
+    if sigma_rel <= 0:
+        return
+    X_stack = np.stack(X_list, axis=1)                        # (n, m)
+    traj_std = float(np.std(X_stack))
+    sigma_abs = float(sigma_rel) * traj_std
+    rng = np.random.default_rng(int(seed))
+    log("info",
+        f"snapshot noise: sigma_rel={sigma_rel:.3e}  "
+        f"trajectory_std={traj_std:.3e}  sigma_abs={sigma_abs:.3e}  "
+        f"snapshots={len(X_list)}")
+    for i, vec in enumerate(X_list):
+        noise = rng.standard_normal(vec.shape).astype(vec.dtype) * sigma_abs
+        X_list[i] = vec + noise
 
 
 class Recorder:
