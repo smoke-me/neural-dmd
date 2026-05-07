@@ -49,6 +49,16 @@ import sys
 import time
 from pathlib import Path
 
+# Force utf-8 on terminal streams as early as possible. Windows defaults
+# stdout/stderr to cp1252, which crashes on Greek letters (ρ, λ) etc.
+# that show up in our logs and summary tables. Idempotent + safe to call
+# again later inside tee_run_log.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from neural_dmd import config as C

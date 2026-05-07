@@ -246,3 +246,35 @@ PRECISION = "float32"
 # ---------------------------------------------------------------------------
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ---------------------------------------------------------------------------
+# REPRODUCIBILITY TIER
+#
+# Controls bit-exactness vs speed trade-off across machines.
+#
+#   "fast"     (default) Multi-threaded BLAS, GPU training when available.
+#              Same-machine runs are bit-exact (full PyTorch determinism
+#              stack is set in train.py). Cross-machine: differs at
+#              4-5 sigfigs because BLAS implementations / instruction
+#              sets / thread counts vary across hosts.
+#
+#   "analysis" Multi-threaded training (fast); single-threaded BLAS +
+#              torch threads at the analysis stage. Train cost
+#              unaffected. Analysis stage runs ~3-5x slower but is
+#              bit-exact across same-architecture machines (x86_64 /
+#              ARM separately) running matched library versions, when
+#              fed identical snapshot bytes (combine with sharing
+#              snapshots.npz across machines for full pipeline
+#              reproducibility).
+#
+#   "strict"  Forces CPU + single-threaded everywhere from training
+#              onwards. ~5-8x slower full pipeline. Bit-exact across
+#              same-architecture machines with matched libraries.
+#
+# Cross-architecture bit-exactness (e.g. x86_64 vs Apple Silicon) is
+# NOT achievable without identical hardware / Docker containers; see
+# the "Reproducibility" section in README.md.
+# ---------------------------------------------------------------------------
+
+REPRO_TIER = "fast"

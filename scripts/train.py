@@ -20,6 +20,13 @@ import sys
 import time
 from pathlib import Path
 
+# Force utf-8 on terminal streams (Windows cp1252 crashes on ρ/λ/Δ).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 # Make the neural_dmd package importable when launched directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -28,6 +35,7 @@ import torch
 
 from neural_dmd import config as C
 from neural_dmd import experiments as E
+from neural_dmd import repro as R
 from neural_dmd.data import get_loaders
 from neural_dmd.log import banner, log, progress
 from neural_dmd.metrics import LOSSES
@@ -37,7 +45,8 @@ from neural_dmd.snapshots import Recorder, inject_snapshot_noise
 
 
 def train_epoch(model, loader, opt, sched, recorder, loss_fn, *,
-                epoch_idx: int, total_epochs: int, base_step: int):
+                epoch_idx: int, total_epochs: int, base_step: int,
+                device: str):
     # Run one full pass over the training set. Returns mean loss + accuracy
     # measured on the training data (NOT a measure of generalisation).
     model.train()
@@ -46,7 +55,7 @@ def train_epoch(model, loader, opt, sched, recorder, loss_fn, *,
     t_epoch = time.time()
 
     for batch_idx, (x, y) in enumerate(loader, start=1):
-        x, y = x.to(C.DEVICE), y.to(C.DEVICE)
+        x, y = x.to(device), y.to(device)
 
         opt.zero_grad()
         logits = model(x)
@@ -109,20 +118,45 @@ def main():
         log("warn",
             f"train.py: cache hit for data_hash={dh} but --force given, retraining")
 
-    # ----- seed for determinism -----
+    # ----- full determinism stack -----
+    # Within-machine bit-exact reproducibility requires more than just
+    # seeding the RNGs - the major sources of run-to-run drift are
+    # cuDNN's non-deterministic conv/matmul kernels and the DataLoader
+    # workers' own RNG streams. Setting all of the below makes a
+    # second run on the same machine produce byte-identical snapshots.
+    # NOTE: CROSS-MACHINE reproducibility (you vs your friend) is NOT
+    # achievable in code: BLAS/LAPACK implementations, CPU instruction
+    # set, and library versions all introduce float-arithmetic drift
+    # that no seed controls. See README "Reproducibility" section.
     seed = int(getattr(C, "SEED", 0))
-    torch.manual_seed(seed)
+    os.environ.setdefault("PYTHONHASHSEED", str(seed))
+    # Deterministic cuBLAS workspace -> required for use_deterministic_algorithms
+    # on CUDA. Harmless on CPU.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except (AttributeError, RuntimeError) as e:
+        log("warn", f"torch.use_deterministic_algorithms unavailable ({e})")
+
+    # Apply reproducibility tier (no-op for 'fast' / 'analysis'; forces
+    # single-threaded CPU for 'strict').
+    R.apply_for_training()
+    device = R.effective_device()
 
     # ----- load dataset -----
     banner("training start",
-           dataset=C.DATASET, arch=C.ARCH, device=C.DEVICE,
+           dataset=C.DATASET, arch=C.ARCH, device=device,
            epochs=C.EPOCHS, batch=C.BATCH_SIZE, lr=C.LR, loss=C.LOSS,
            seed=seed, data_hash=dh)
 
-    train_loader, _ = get_loaders(C.DATASET, C.BATCH_SIZE, C.EVAL_BATCH, C.DATA_ROOT)
+    train_loader, _ = get_loaders(C.DATASET, C.BATCH_SIZE, C.EVAL_BATCH, C.DATA_ROOT,
+                                  seed=seed)
 
     total_steps = C.EPOCHS * len(train_loader)
     fit_start_step, fit_end_step = _resolve_fit_window(total_steps)
@@ -140,7 +174,7 @@ def main():
         f"~{n_pre_snaps} pre-fit + ~{n_post_snaps} post-fit snaps")
 
     # ----- build model + optimiser + scheduler -----
-    model   = MLP(C.ARCH).to(C.DEVICE)
+    model   = MLP(C.ARCH).to(device)
     opt     = torch.optim.Adam(model.parameters(), lr=C.LR)
     sched   = cosine(opt, total_steps, min_lr=C.LR_MIN)
     loss_fn = LOSSES[C.LOSS]
@@ -158,7 +192,8 @@ def main():
     for epoch in range(1, C.EPOCHS + 1):
         loss_v, acc_v = train_epoch(model, train_loader, opt, sched, recorder, loss_fn,
                                     epoch_idx=epoch, total_epochs=C.EPOCHS,
-                                    base_step=(epoch - 1) * len(train_loader))
+                                    base_step=(epoch - 1) * len(train_loader),
+                                    device=device)
         log("ok",
             f"epoch {epoch}/{C.EPOCHS}  "
             f"train_loss={loss_v:.4f}  "
@@ -188,7 +223,8 @@ def main():
 
     # write the exact training config used (for reproducibility)
     E.train_config_path().write_text(
-        json.dumps(E.train_config_dict(), indent=2, default=str))
+        json.dumps(E.train_config_dict(), indent=2, default=str),
+        encoding="utf-8")
     log("info", f"saved train_config.json to {E.train_config_path()}")
 
 

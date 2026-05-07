@@ -253,6 +253,33 @@ patience criterion goes inert; only the absolute `tol` and the outer
 iteration spent — useful for diagnostic comparisons or when you
 genuinely want LM to chase the residual all the way down.
 
+### LM iteration counting (Opt / cOpt)
+
+`max_iter` counts only **accepted** iterations now (where the residual
+actually dropped). The Levenberg-Marquardt damping retry loop is
+internal:
+
+- **Outer step** = one accepted move. Builds the Jacobian + scales
+  once. Caps at `max_iter`.
+- **Inner trust-region** = retries the linear solve with bumped `nu`
+  when residual rose. Caps at `gmax` consecutive retries per outer
+  step. Jacobian is **not** recomputed during retries (it doesn't
+  depend on `nu`).
+
+Practical effects vs the old loop:
+- `max_iter=50` now means 50 *real* progress steps, not 50 attempts
+  with rejected ones eating budget.
+- Rejected steps no longer recompute the Jacobian (was wasted work).
+- `gmax` is now a "consecutive retries within one outer step" cap
+  rather than a global cumulative cap; if the optimizer ever needs
+  more than `gmax` rejections in a row to make ANY progress, that
+  outer step terminates LM.
+
+The summary table's `LM iters` column reflects accepted-iter count;
+the run.log shows iter labels like `iter 5.2` when an inner retry
+fires (outer 5, inner restart 2), and the final summary line reports
+both `accepted_iters` and `inner_attempts`.
+
 ### Snapshot noise (`NOISE_SIGMA`)
 
 ```python
@@ -478,6 +505,89 @@ under `outputs/experiments/` and reuse the same training data when the
 training-relevant fields match.
 
 ---
+
+## Reproducibility
+
+The pipeline runs seeded by `config.SEED` and sets the full PyTorch
+determinism stack:
+
+```python
+os.environ["PYTHONHASHSEED"]            = str(seed)
+os.environ["CUBLAS_WORKSPACE_CONFIG"]   = ":4096:8"
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+torch.backends.cudnn.deterministic      = True
+torch.backends.cudnn.benchmark          = False
+torch.use_deterministic_algorithms(True, warn_only=True)
+DataLoader(..., generator=torch.Generator().manual_seed(seed))
+```
+
+### Same machine, two runs → bit-exact
+
+With those flags, re-running `python scripts/run_exp.py` on the same
+machine with the same config produces byte-identical
+`outputs/data/<hash>/snapshots.npz` and identical method outputs.
+
+### Different machines → results will differ slightly
+
+Cross-machine bit-exactness is **not** achievable in code. Two layers
+of float-arithmetic drift remain even with identical configs:
+
+1. **BLAS/LAPACK implementation**: MKL (Intel/Anaconda) vs OpenBLAS
+   (default Linux pip wheels) vs Accelerate (Apple Silicon). SVD,
+   eigendecomposition, and matmul produce slightly different bits per
+   element. Our pipeline iterates a 1500-step forecast; tiny
+   per-element drift compounds to visible per-method differences.
+2. **CPU instruction set + thread count**: AVX vs AVX-512 vs ARM
+   NEON, and parallel reduction order, change the order of
+   floating-point additions. `a + b + c` is not associative in
+   floating point.
+
+Same training data → different `Spectral ρ` to the 4th–5th digit
+between machines. That cascades through the rest of the pipeline.
+
+### Tier knob (`REPRO_TIER`)
+
+```python
+REPRO_TIER = "fast"      # multi-thread + GPU (default)
+REPRO_TIER = "analysis"  # multi-thread training, single-thread analysis
+REPRO_TIER = "strict"    # single-thread + force CPU everywhere
+```
+
+| Tier       | Training         | Analysis         | Cross-machine bit-exact?            | Speed cost            |
+|------------|------------------|------------------|--------------------------------------|------------------------|
+| `fast`     | multi-thread / GPU | multi-thread   | ❌ differs at 4–5 sigfigs            | baseline (~7 min)      |
+| `analysis` | multi-thread / GPU | single-thread  | ✅ same arch + matched libs (analysis only); needs identical snapshots | ~3× slower analysis only (~12 min total) |
+| `strict`   | CPU + 1 thread     | CPU + 1 thread | ✅ same arch + matched libs (full)    | ~5× slower (~30 min)   |
+
+`analysis` is the practical sweet spot when you want to validate
+analyses match across collaborators without paying training-side
+slowdown: train normally, share `outputs/data/<hash>/snapshots.npz`,
+run analysis under the tier.
+
+`strict` is for "I genuinely need the whole pipeline reproducible
+from scratch" — papers / archival runs.
+
+Implementation: `neural_dmd/repro.py` uses `threadpoolctl` to clamp
+all BLAS / OpenMP pools to one thread at runtime, plus
+`torch.set_num_threads(1)`. Train.py reads `R.effective_device()`
+which forces CPU under `strict`. Tier transitions are logged.
+
+### What this means in practice
+
+- **Qualitatively reproducible across machines.** sDMDc beats DMDc when
+  DMDc is unstable; OptDMDc/cOptDMDc collapse at low rank when LM
+  overfits; rank scan picks "near the elbow" of the spectrum. These
+  conclusions hold across machines.
+- **Not numerically reproducible across machines.** Specific values
+  like `out_dloss=0.039` vs `0.107` may differ because BLAS
+  implementations differ. Both are correct results of the same
+  algorithm on the same input snapshots.
+- **For numerically reproducible runs**: pin Python + NumPy + PyTorch
+  + BLAS versions and run on identical hardware. In practice this
+  means a Docker container with explicit `numpy==X.Y.Z` and either
+  `mkl` or `openblas` chosen explicitly.
 
 ## How to read the metrics
 

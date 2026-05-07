@@ -374,6 +374,11 @@ def run_full_pipeline(methods: list[str] | tuple[str, ...] | None = None,
     if unknown:
         raise ValueError(f"unknown ops: {unknown}; valid: {list(_OP_DISPATCH)}")
 
+    # Apply reproducibility tier (no-op for 'fast'; locks BLAS to one
+    # thread + torch.set_num_threads(1) for 'analysis' or 'strict').
+    from . import repro as R
+    R.apply_for_analysis()
+
     _log_memory_estimate(methods)
 
     # Auto rank-selection for OptDMDc / cOptDMDc. Runs a quick held-out

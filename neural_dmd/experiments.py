@@ -307,9 +307,11 @@ def init_exp() -> str:
         "data_hash":      data_hash(),
         "methods":        methods,
     }
-    manifest_path().write_text(json.dumps(manifest, indent=2))
+    manifest_path().write_text(json.dumps(manifest, indent=2),
+                               encoding="utf-8")
     config_snapshot_path().write_text(
-        json.dumps(snapshot_full_config(), indent=2, default=str))
+        json.dumps(snapshot_full_config(), indent=2, default=str),
+        encoding="utf-8")
     log("info", f"experiments: init exp_id={eid}  data_hash={data_hash()}  dir={d}")
     return eid
 
@@ -388,10 +390,29 @@ def tee_run_log() -> None:
     """Mirror sys.stdout / sys.stderr into the experiment's run.log.
     The terminal stream keeps ANSI colour; the run.log stream has the
     escape codes stripped so the log file is readable in plain text
-    editors. Idempotent."""
+    editors. Idempotent.
+
+    Forces utf-8 on every writer so non-ASCII (ρ, λ, Δ, ←, →, etc.)
+    survives:
+      - the on-disk run.log is opened with encoding='utf-8'
+      - the original sys.stdout/sys.stderr (terminal) are reconfigured
+        to utf-8 with errors='replace', avoiding Windows cp1252 crashes
+    """
     if getattr(sys.stdout, "_neural_dmd_tee", False):
         return
-    fp = open(run_log_path(), "a", buffering=1)        # line-buffered
+
+    # Reconfigure terminal streams to utf-8 so prints of ρ / λ / Δ etc.
+    # don't crash on Windows (default cp1252) or any other 8-bit locale.
+    # `errors="replace"` keeps the program alive even on truly exotic
+    # output streams that still can't represent a particular char.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+    fp = open(run_log_path(), "a", buffering=1,
+              encoding="utf-8", errors="replace")     # line-buffered, utf-8
     fp.write(f"\n# === run.log opened at {time.strftime('%Y-%m-%dT%H:%M:%S')} ===\n")
     new_out = _Tee((sys.stdout, False), (fp, True))
     new_out._neural_dmd_tee = True                     # type: ignore[attr-defined]
@@ -408,21 +429,21 @@ def write_metric(method: str, key: str, value) -> None:
     Value is JSON-serialisable (str fallback for anything weird)."""
     p = metrics_path()
     try:
-        d = json.loads(p.read_text()) if p.exists() else {}
+        d = json.loads(p.read_text(encoding="utf-8", errors="replace")) if p.exists() else {}
     except Exception:
         d = {}
     d.setdefault(method, {})[key] = value
-    p.write_text(json.dumps(d, indent=2, default=str))
+    p.write_text(json.dumps(d, indent=2, default=str), encoding="utf-8")
 
 
 def write_metrics_bulk(method: str, mapping: dict) -> None:
     p = metrics_path()
     try:
-        d = json.loads(p.read_text()) if p.exists() else {}
+        d = json.loads(p.read_text(encoding="utf-8", errors="replace")) if p.exists() else {}
     except Exception:
         d = {}
     d.setdefault(method, {}).update(mapping)
-    p.write_text(json.dumps(d, indent=2, default=str))
+    p.write_text(json.dumps(d, indent=2, default=str), encoding="utf-8")
 
 
 def read_metrics() -> dict:
@@ -430,7 +451,7 @@ def read_metrics() -> dict:
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text())
+        return json.loads(p.read_text(encoding="utf-8", errors="replace"))
     except Exception:
         return {}
 
@@ -745,7 +766,8 @@ def write_summary() -> None:
         return
 
     try:
-        manifest = json.loads(manifest_path().read_text())
+        manifest = json.loads(
+            manifest_path().read_text(encoding="utf-8", errors="replace"))
     except Exception:
         manifest = {}
 
@@ -926,7 +948,7 @@ def write_summary() -> None:
 
     out.append("</main></body></html>")
 
-    summary_path().write_text("\n".join(out))
+    summary_path().write_text("\n".join(out), encoding="utf-8")
     size_kb = summary_path().stat().st_size / 1024
     log("ok",
         f"experiments.write_summary: wrote {summary_path()}  ({size_kb:.0f} KB)")

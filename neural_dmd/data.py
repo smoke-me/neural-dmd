@@ -8,6 +8,7 @@ To add a new dataset:
      layer matches the flattened input dim and the last matches #classes.
 """
 
+import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
@@ -31,15 +32,24 @@ DATASETS = {
 }
 
 
-def get_loaders(name: str, batch_size: int, eval_batch: int, root):
+def get_loaders(name: str, batch_size: int, eval_batch: int, root, *,
+                seed: int = 0):
     # Look up the Dataset class + transform for the chosen name and build
     # train / test DataLoaders. First call downloads the data into `root`.
     # `root` may be a str or pathlib.Path; torchvision accepts either.
+    #
+    # `seed` controls the train-loader's shuffle order so re-runs on the
+    # same machine are bit-exact. We pass an explicit `generator` (not
+    # the global torch RNG) so DataLoader's shuffling doesn't depend on
+    # how many other torch RNG draws happened earlier in the process.
     DS, tx = DATASETS[name]
     root = str(root)
     train = DS(root, train=True,  download=True, transform=tx)
     test  = DS(root, train=False, download=True, transform=tx)
+    g = torch.Generator()
+    g.manual_seed(int(seed))
     return (
-        DataLoader(train, batch_size=batch_size, shuffle=True),
-        DataLoader(test,  batch_size=eval_batch),
+        DataLoader(train, batch_size=batch_size, shuffle=True,
+                   generator=g, num_workers=0),
+        DataLoader(test,  batch_size=eval_batch, num_workers=0),
     )

@@ -289,50 +289,70 @@ def run(snap: dict, *, rank: int | None = None, pod_rank: int | None = None,
         f"OptDMDc: iter   0  residual={res_norm:.6e}  "
         f"Psi={Psi.shape}  Omega={Omega.shape}")
 
+    # Decoupled outer / inner LM driver:
+    #   - outer step = one ACCEPTED iteration. `max_iter` caps these.
+    #   - inner trust-region loop = retry the linear solve with bumped
+    #     `nu` when the proposed step makes residual worse. Capped by
+    #     `gmax`. Jacobian + scales computed ONCE per outer step,
+    #     since neither depends on nu.
     stopper = EarlyStopper(tol_abs=tol, tol_rel=tol_rel, patience=patience)
     stop_reason = "max_iter"
     nu = nu0
-    restarts = 0
     iters_done = 0
-    for it in range(1, max_iter + 1):
-        iters_done = it
+    total_inner_attempts = 0
+    while iters_done < max_iter:
+        # Build Jacobian + column scales once for this accepted step.
         J = _jacobian_columns(Psi, dPsi, Up, sp, Vhp, Omega, R, p)
         scales = np.linalg.norm(J, axis=0).real
 
-        delta = _solve_lm_unconstrained(J, rho, nu, scales)
-        gamma_trial = gamma - delta
-
-        Psi_t, dPsi_t, Up_t, sp_t, Vhp_t, Omega_t, R_t = fit(gamma_trial)
-        rho_t = R_t.reshape(-1)
-        res_t = np.linalg.norm(rho_t)
-
-        if res_t > res_norm:
-            restarts += 1
+        # Inner trust-region loop: try delta with current nu, bump nu
+        # and retry if residual rose. Hard cap at `gmax` retries.
+        accepted = False
+        inner_restarts = 0
+        for inner in range(gmax + 1):
+            delta = _solve_lm_unconstrained(J, rho, nu, scales)
+            gamma_trial = gamma - delta
+            Psi_t, dPsi_t, Up_t, sp_t, Vhp_t, Omega_t, R_t = fit(gamma_trial)
+            rho_t = R_t.reshape(-1)
+            res_t = np.linalg.norm(rho_t)
+            total_inner_attempts += 1
+            if res_t <= res_norm:
+                accepted = True
+                break
+            inner_restarts += 1
             nu *= incr
             log("warn",
-                f"OptDMDc: iter {it:3d}  residual rose ({res_t:.6e})  "
-                f"nu={nu:.3e}  restarts={restarts}/{gmax}")
-            if restarts > gmax:
-                log("warn", "OptDMDc: gmax exceeded, stopping LM loop")
-                stop_reason = f"gmax exceeded ({restarts}>{gmax})"
-                break
-            continue
+                f"OptDMDc: iter {iters_done + 1:3d}.{inner_restarts:<2d}  "
+                f"residual rose ({res_t:.6e})  nu={nu:.3e}  "
+                f"restarts={inner_restarts}/{gmax}")
+        if not accepted:
+            log("warn",
+                f"OptDMDc: gmax={gmax} consecutive restarts exhausted at "
+                f"outer iter {iters_done + 1}; stopping LM")
+            stop_reason = f"gmax exhausted ({gmax} consecutive rejections)"
+            break
+
+        # Accept the step.
         gamma, Psi, dPsi, Up, sp, Vhp, Omega, R, rho, res_norm = (
             gamma_trial, Psi_t, dPsi_t, Up_t, sp_t, Vhp_t,
             Omega_t, R_t, rho_t, res_t)
+        iters_done += 1
         log("info",
-            f"OptDMDc: iter {it:3d}  residual={res_norm:.6e}  nu={nu:.3e}  "
-            f"||delta||={np.linalg.norm(delta):.3e}")
-        if restarts == 0:
+            f"OptDMDc: iter {iters_done:3d}  residual={res_norm:.6e}  "
+            f"nu={nu:.3e}  ||delta||={np.linalg.norm(delta):.3e}  "
+            f"inner_restarts={inner_restarts}")
+        # Loosen damping only on a clean (no-restart) accept.
+        if inner_restarts == 0:
             nu = nu / decr
-        restarts = 0
         if stopper.update(res_norm):
-            log("ok", f"OptDMDc: early-stopped at iter {it} - {stopper.reason}")
+            log("ok",
+                f"OptDMDc: early-stopped at iter {iters_done} - {stopper.reason}")
             stop_reason = stopper.reason
             break
 
     log("ok",
         f"OptDMDc: stage 3/4  LM done in {time.time() - t1:.2f}s  "
+        f"accepted_iters={iters_done}  inner_attempts={total_inner_attempts}  "
         f"final_residual={res_norm:.6e}  stop={stop_reason}")
 
     # ----- 4. reduced operator + forecast -----
