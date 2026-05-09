@@ -802,11 +802,38 @@ def write_summary() -> None:
     if desc:
         out.append(f'<div class="description">{h(desc)}</div>')
 
+    # Surface the training-relevant config knobs that change how the
+    # numbers below should be interpreted (noise level, fit window,
+    # epochs, precision, repro tier). Each of these participates in
+    # data_hash, so they're stable for the lifetime of the experiment;
+    # we read them from the active config module.
+    noise = float(getattr(C, "NOISE_SIGMA", 0.0) or 0.0)
+    fit_range = getattr(C, "FIT_RANGE", None)
+    fit_frac  = getattr(C, "FIT_FRAC", None)
+    if fit_range is not None:
+        fit_window_str = (f"FIT_RANGE = ({int(fit_range[0])}, "
+                          f"{int(fit_range[1])})")
+    else:
+        fit_window_str = (f"FIT_FRAC = {fit_frac:.3f}"
+                          if fit_frac is not None else "—")
+
+    if noise > 0:
+        noise_html = (f"<code>NOISE_SIGMA = {noise:.3e}</code> "
+                      "(rel. to trajectory std; noise is BAKED into "
+                      "this experiment's snapshot cache)")
+    else:
+        noise_html = '<code>NOISE_SIGMA = 0.0</code> (clean snapshots)'
+
     out.append('<dl class="meta">')
     out.append(f"<dt>Label</dt><dd><code>{h(label)}</code></dd>")
     out.append(f"<dt>Run time</dt><dd><code>{h(iso_time)}</code></dd>")
     out.append(f"<dt>Data</dt><dd><code>outputs/data/{h(dh)}/</code></dd>")
     out.append(f"<dt>Methods</dt><dd><code>{h(', '.join(methods))}</code></dd>")
+    out.append(f"<dt>Snapshot noise</dt><dd>{noise_html}</dd>")
+    out.append(f"<dt>Fit window</dt><dd><code>{h(fit_window_str)}</code></dd>")
+    out.append(f"<dt>Epochs</dt><dd><code>{h(str(getattr(C, 'EPOCHS', '—')))}</code></dd>")
+    out.append(f"<dt>Precision</dt><dd><code>{h(str(getattr(C, 'PRECISION', 'float64')))}</code></dd>")
+    out.append(f"<dt>Repro tier</dt><dd><code>{h(str(getattr(C, 'REPRO_TIER', 'fast')))}</code></dd>")
     out.append("</dl>")
 
     # --- main metrics table ---
