@@ -128,7 +128,7 @@ FIT_RANGE = None
 #
 # To turn noise OFF: set NOISE_SIGMA = 0.0 (or any value <= 0). The
 # inject_snapshot_noise call becomes a no-op.
-NOISE_SIGMA = 1.0
+NOISE_SIGMA = 0.0
 
 # ---------------------------------------------------------------------------
 # METHOD PARAMS

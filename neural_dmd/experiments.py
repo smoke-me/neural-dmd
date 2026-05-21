@@ -243,6 +243,15 @@ def plot_path(method: str, kind: str) -> Path:
     return plot_dir(method) / f"{kind}.png"
 
 
+def curves_dir() -> Path:
+    """Per-method eval-curve cache (loss + classification metrics over
+    the eval grid for each method's predicted network). See
+    runners._pred_eval_curve_cached for the schema."""
+    d = exp_dir() / "curves"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def run_log_path() -> Path:
     return exp_dir() / "run.log"
 
@@ -527,25 +536,25 @@ def log_eigenvalue_report(label: str, eigvals, *,
 # summary.md
 # ---------------------------------------------------------------------------
 
-_SUMMARY_KEYS = [
-    ("rank",                "Rank"),
-    ("pod_rank",            "POD rank"),
-    ("spectral_radius",     "Spectral ρ"),
-    ("n_outside",           "λ>1"),
-    ("in_sample_dacc_pct",  "In Δacc%"),
-    ("out_sample_dacc_pct", "Out Δacc%"),
-    ("in_sample_dloss",     "In Δloss"),
-    ("out_sample_dloss",    "Out Δloss"),
-    ("lm_iters",            "LM iters"),
-    ("lm_stop_reason",      "LM stop"),
-    ("wall_seconds",        "Wall (s)"),
+# Canonical ordering of the test-set metrics shown in the summary
+# tables. (key, display name). Mirrors runners._CURVE_METRICS.
+_TEST_METRICS = [
+    ("loss",      "loss"),
+    ("accuracy",  "accuracy"),
+    ("precision", "precision"),
+    ("recall",    "recall"),
+    ("f1",        "F1"),
 ]
 
-_FORECAST_KEYS = [
-    ("forecast_loss_actual_final", "actual final L"),
-    ("forecast_loss_pred_final",   "pred final L"),
-    ("forecast_loss_actual_min",   "actual min L"),
-    ("forecast_loss_pred_min",     "pred min L"),
+# Per-method stability + cost columns shown alongside the forecasted
+# test metrics. Pure-DMDc methods (no LM) leave the LM columns blank.
+_STABILITY_KEYS = [
+    ("rank",            "rank"),
+    ("spectral_radius", "spectral ρ"),
+    ("n_outside",       "λ>1"),
+    ("lm_iters",        "LM iters"),
+    ("lm_stop_reason",  "LM stop"),
+    ("wall_seconds",    "wall (s)"),
 ]
 
 
@@ -564,7 +573,13 @@ def _fmt_cell(key: str, val) -> str:
             return f"{val:.2f}"
         if "wall" in key:
             return f"{val:.1f}"
-        if "spectral" in key or "loss" in key:
+        # signed display for the forecast-vs-real gap columns
+        if key.startswith("gap_"):
+            return f"{val:+.4f}"
+        # all [0,1] test metrics + loss + spectral radius land here
+        if any(tag in key
+               for tag in ("loss", "accuracy", "precision", "recall",
+                           "f1", "spectral")):
             return f"{val:.4f}"
         return f"{val:.4g}"
     return str(val)
@@ -752,14 +767,239 @@ section.method-plots h3 { margin-top: 0; }
   color: var(--fg-muted);
   margin: 0.4em 0 1em;
 }
+dl.glossary {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 1.2em;
+  row-gap: 0.55em;
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 1em 1.2em;
+  margin: 1em 0 1.5em;
+  font-size: 0.95em;
+}
+dl.glossary dt {
+  font-weight: 600;
+  color: var(--accent);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.92em;
+}
+dl.glossary dd {
+  margin: 0;
+  color: var(--fg);
+}
+details.config-dump {
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 0.6em 1em;
+  margin: 1em 0 1.5em;
+}
+details.config-dump summary {
+  cursor: pointer;
+  padding: 0.2em 0;
+  outline: none;
+}
+details.config-dump table { margin-top: 0.8em; }
+details.config-dump pre {
+  background: var(--code-bg);
+  margin: 0;
+  padding: 0.5em 0.7em;
+  border-radius: 4px;
+  font-size: 0.86em;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.cm-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  gap: 1em;
+  margin: 1em 0 1.5em;
+}
+.cm-strip > div { min-width: 0; }
+.cm-strip table { margin: 0.3em 0; font-size: 0.88em; }
+.cm-strip th, .cm-strip td { padding: 0.3em 0.5em; }
+.cm-strip h4 {
+  margin: 0 0 0.3em;
+  font-size: 1.0em;
+}
 """.strip()
+
+
+# Per-method display label looked up from the methods registry; falls
+# back to the raw key when the method isn't (or no longer) registered.
+def _method_label(method: str) -> str:
+    try:
+        from .methods import get as _get
+        return _get(method).get("label", method)
+    except Exception:
+        return method
+
+
+# Captions for the per-method plot section. One-line layman gloss so
+# the report reader knows what they're looking at without having to
+# trace it back to the source code.
+_PLOT_CAPTIONS = {
+    "loss": ("Test-loss curves: the real network's test loss at each "
+             "recorded training step (cyan), and the forecast's loss "
+             "when its predicted weights are plugged into the same "
+             "network (dashed orange). Lower is better. The dashed "
+             "vertical line marks where the fit window ends and the "
+             "forecast begins."),
+    "classification": ("Four classification metrics evaluated on the "
+                       "test set at every recorded step, for the real "
+                       "network vs the forecasted network. All four "
+                       "live in [0, 1]; higher is better. The dashed "
+                       "vertical line marks the fit/forecast boundary."),
+    "accuracy": ("How close the forecast's parameter vector is to the "
+                 "real one in raw L2 distance, expressed as a percentage. "
+                 "100% means an exact match. This is reconstruction "
+                 "quality in weight space, NOT classification accuracy."),
+    "eigenvalues": ("Spectrum of the linear operator the method "
+                    "learns. Eigenvalues inside the dashed unit circle "
+                    "decay (stable forecast); outside they grow "
+                    "exponentially (forecast eventually diverges)."),
+}
+
+
+def _metric_glossary_html() -> str:
+    """Concise, dataset-agnostic definitions for the test-set metrics
+    used throughout the report. Rendered as a definition list inside
+    the "What this report shows" section so the rest of the report can
+    refer to these terms without re-defining them."""
+    loss_name = str(getattr(C, "LOSS", "cross_entropy")).replace("_", " ")
+    items = [
+        ("loss",
+         f"Here, <strong>{html.escape(loss_name)}</strong> on the test set. "
+         "Measures how confident-yet-wrong the network's predicted "
+         "probabilities are. 0 = perfect; grows without bound as the "
+         "network becomes more confidently wrong. Lower is better."),
+        ("accuracy",
+         "Fraction of test items the network classifies correctly. "
+         "In [0, 1]; higher is better. Easy to read, but blind to "
+         "class imbalance."),
+        ("precision (macro)",
+         "Of all items the network labels as class <em>c</em>, what "
+         "fraction actually are <em>c</em>. Low precision ⇒ many false "
+         "alarms. We report the <em>macro</em> average: precision is "
+         "computed per class then averaged with equal weight, so rare "
+         "classes count as much as common ones. In [0, 1]; higher is better."),
+        ("recall (macro)",
+         "Of all items that actually are class <em>c</em>, what fraction "
+         "the network catches. Low recall ⇒ many misses. Macro-averaged "
+         "across classes. In [0, 1]; higher is better."),
+        ("F1 (macro)",
+         "Harmonic mean of precision and recall. Punishes models that "
+         "score high on one but not the other. Macro-averaged across "
+         "classes. In [0, 1]; higher is better."),
+        ("confusion matrix",
+         "Table where cell <code>(i, j)</code> counts the test items "
+         "whose true class is <em>i</em> and that the network predicted "
+         "as class <em>j</em>. The diagonal is correct predictions; "
+         "everything off-diagonal is a mistake. The pattern of off-"
+         "diagonal mass tells you <em>which</em> classes the network "
+         "confuses, not just how often it errs."),
+    ]
+    parts = ['<dl class="glossary">']
+    for term, body in items:
+        parts.append(f"<dt>{html.escape(term)}</dt><dd>{body}</dd>")
+    parts.append("</dl>")
+    return "\n".join(parts)
+
+
+def _is_confusion_matrix(cm) -> bool:
+    """True iff `cm` looks like a non-empty square list-of-lists."""
+    return (isinstance(cm, list) and len(cm) > 0
+            and isinstance(cm[0], list) and len(cm[0]) == len(cm))
+
+
+def _render_confusion_table(cm, h) -> str:
+    """Render a square confusion-matrix list-of-lists as an HTML table.
+    Diagonal cells get the 'good' colour class; everything else stays
+    neutral so off-diagonal mass reads as the visual signal."""
+    n = len(cm)
+    parts = ["<table>"]
+    parts.append("<thead><tr><th></th>")
+    for j in range(n):
+        parts.append(f"<th>p={h(str(j))}</th>")
+    parts.append("</tr></thead><tbody>")
+    for i, row in enumerate(cm):
+        parts.append("<tr>")
+        parts.append(f"<td class='method-cell'>t={h(str(i))}</td>")
+        for j, v in enumerate(row):
+            cls = "num good" if i == j and v > 0 else "num"
+            parts.append(f"<td class='{cls}'>{h(_fmt_cell('cm', v))}</td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "\n".join(parts)
+
+
+def _render_config_dump(h) -> str:
+    """Read the on-disk config.json snapshot for this experiment (written
+    by init_exp()) and emit it as a collapsible <details> block. Falls
+    back to a live snapshot if the file is missing."""
+    try:
+        text = config_snapshot_path().read_text(encoding="utf-8",
+                                                errors="replace")
+        cfg  = json.loads(text)
+    except Exception:
+        try:
+            cfg = snapshot_full_config()
+        except Exception as e:
+            return (f'<p class="note">(config snapshot unavailable: '
+                    f"{h(str(e))})</p>")
+
+    # Format each (key, value) row. Strings get a code-style cell; bigger
+    # nested structures (lists, dicts, control_fn source) collapse into
+    # a <pre> for readability while still being scannable in the doc.
+    def _fmt_value(v) -> str:
+        if isinstance(v, str) and "\n" in v:
+            return f"<pre>{h(v)}</pre>"
+        if isinstance(v, (list, tuple, dict)):
+            return f"<pre>{h(json.dumps(v, indent=2, default=str))}</pre>"
+        if isinstance(v, bool):
+            return f"<code>{h(str(v))}</code>"
+        if isinstance(v, (int, float)):
+            return f"<code>{h(_fmt_cell('cfg', float(v)) if isinstance(v, float) else str(v))}</code>"
+        if v is None:
+            return "<code>None</code>"
+        return f"<code>{h(str(v))}</code>"
+
+    parts = []
+    parts.append('<details class="config-dump"><summary>'
+                 "<strong>Show full configuration snapshot</strong>  "
+                 "<span class='note' style='font-weight:normal;'>"
+                 "(every UPPERCASE attribute of <code>neural_dmd.config</code> "
+                 "at the moment this experiment was launched; what you would "
+                 "need to reproduce this run byte-for-byte)"
+                 "</span></summary>")
+    parts.append("<table>")
+    parts.append("<thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>")
+    for key in sorted(cfg.keys()):
+        parts.append(f"<tr><td class='method-cell'><code>{h(key)}</code></td>"
+                     f"<td>{_fmt_value(cfg[key])}</td></tr>")
+    parts.append("</tbody></table></details>")
+    return "\n".join(parts)
 
 
 def write_summary() -> None:
     """Aggregate metrics.json + manifest into a self-contained HTML
     report at <exp_dir>/summary.html. PNG plots are inlined as base64
     data URLs so the file renders correctly in any browser regardless
-    of where it's moved."""
+    of where it's moved.
+
+    Layout (kept tight so values do not repeat across tables):
+
+      1. Header + experiment configuration (run metadata)
+      2. "What this report shows" - layman intro
+      3. Real neural network - final test metrics + confusion matrix
+      4. Forecasted neural networks - final test metrics by method
+      5. Operator stability - rank, spectral radius, LM convergence
+      6. Rank scan (if the auto scan ran)
+      7. Plots - cross-method overlay then per-method PNG grid
+    """
     metrics = read_metrics()
     if not metrics:
         log("warn", "experiments.write_summary: no metrics to write")
@@ -772,14 +1012,14 @@ def write_summary() -> None:
         manifest = {}
 
     eid       = exp_id()
-    label     = manifest.get("label", "default")
+    exp_label = manifest.get("label", "default")
     desc      = manifest.get("description", "")
     iso_time  = manifest.get("iso_time", "")
     dh        = manifest.get("data_hash", data_hash())
 
     methods_cfg = list(getattr(C, "METHODS", tuple(metrics.keys())))
-    # Method-row entries: ignore any "__meta__" keys (e.g. __rank_scan__),
-    # which are rendered in their own dedicated sections.
+    # Method-row entries: ignore any "__meta__" keys (e.g. __rank_scan__,
+    # __actual__), which are rendered in their own dedicated sections.
     metric_methods = [m for m in metrics if not m.startswith("__")]
     methods = [m for m in methods_cfg if m in metric_methods] + \
               [m for m in metric_methods if m not in methods_cfg]
@@ -797,16 +1037,11 @@ def write_summary() -> None:
     out.append("</head>")
     out.append("<body><main>")
 
-    # header
+    # ----- 1. Header -----
     out.append(f"<h1>Experiment: <code>{h(eid)}</code></h1>")
     if desc:
         out.append(f'<div class="description">{h(desc)}</div>')
 
-    # Surface the training-relevant config knobs that change how the
-    # numbers below should be interpreted (noise level, fit window,
-    # epochs, precision, repro tier). Each of these participates in
-    # data_hash, so they're stable for the lifetime of the experiment;
-    # we read them from the active config module.
     noise = float(getattr(C, "NOISE_SIGMA", 0.0) or 0.0)
     fit_range = getattr(C, "FIT_RANGE", None)
     fit_frac  = getattr(C, "FIT_FRAC", None)
@@ -819,76 +1054,220 @@ def write_summary() -> None:
 
     if noise > 0:
         noise_html = (f"<code>NOISE_SIGMA = {noise:.3e}</code> "
-                      "(rel. to trajectory std; noise is BAKED into "
-                      "this experiment's snapshot cache)")
+                      "(rel. to trajectory std; baked into the snapshot cache)")
     else:
         noise_html = '<code>NOISE_SIGMA = 0.0</code> (clean snapshots)'
 
     out.append('<dl class="meta">')
-    out.append(f"<dt>Label</dt><dd><code>{h(label)}</code></dd>")
+    out.append(f"<dt>Label</dt><dd><code>{h(exp_label)}</code></dd>")
     out.append(f"<dt>Run time</dt><dd><code>{h(iso_time)}</code></dd>")
-    out.append(f"<dt>Data</dt><dd><code>outputs/data/{h(dh)}/</code></dd>")
-    out.append(f"<dt>Methods</dt><dd><code>{h(', '.join(methods))}</code></dd>")
-    out.append(f"<dt>Snapshot noise</dt><dd>{noise_html}</dd>")
-    out.append(f"<dt>Fit window</dt><dd><code>{h(fit_window_str)}</code></dd>")
+    out.append(f"<dt>Dataset</dt><dd><code>{h(str(getattr(C, 'DATASET', '—')).upper())}</code></dd>")
+    out.append(f"<dt>Data cache</dt><dd><code>outputs/data/{h(dh)}/</code></dd>")
     out.append(f"<dt>Epochs</dt><dd><code>{h(str(getattr(C, 'EPOCHS', '—')))}</code></dd>")
-    out.append(f"<dt>Precision</dt><dd><code>{h(str(getattr(C, 'PRECISION', 'float64')))}</code></dd>")
-    out.append(f"<dt>Repro tier</dt><dd><code>{h(str(getattr(C, 'REPRO_TIER', 'fast')))}</code></dd>")
+    out.append(f"<dt>Fit window</dt><dd><code>{h(fit_window_str)}</code></dd>")
+    out.append(f"<dt>Snapshot noise</dt><dd>{noise_html}</dd>")
+    out.append(f"<dt>Precision / repro tier</dt>"
+               f"<dd><code>{h(str(getattr(C, 'PRECISION', 'float64')))}</code>"
+               f" / <code>{h(str(getattr(C, 'REPRO_TIER', 'fast')))}</code></dd>")
     out.append("</dl>")
 
-    # --- main metrics table ---
-    out.append("<h2>Metrics</h2>")
+    # ----- 2. Layman intro -----
+    dataset_name = str(getattr(C, "DATASET", "the dataset")).upper()
+    n_classes = int(C.ARCH[-1]) if getattr(C, "ARCH", None) else None
+    arch_str  = " → ".join(str(x) for x in getattr(C, "ARCH", []) or [])
+    methods_in_run = ", ".join(_method_label(m) for m in methods)
+    # Best-effort model-class name + parameter count. The training stack
+    # builds whatever model.py exposes for the current run; if it ever
+    # diverges from "an MLP", the description below still reads true.
+    model_class_name = "neural network"
+    n_params = None
+    try:
+        from .model import MLP as _ModelClass  # type: ignore
+        model_class_name = _ModelClass.__name__
+        try:
+            _instance = _ModelClass(getattr(C, "ARCH", []))
+            n_params  = sum(p.numel() for p in _instance.parameters())
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    out.append("<h2>What this report shows</h2>")
+    classes_hint = (f" ({n_classes} classes)" if n_classes else "")
+    arch_hint    = ""
+    if arch_str:
+        arch_hint = (f" The classifier is a <code>{h(model_class_name)}</code> "
+                     f"with layer widths <code>{h(arch_str)}</code>")
+        if n_params:
+            arch_hint += f" ({n_params:,} trainable parameters)"
+        arch_hint += "."
+    methods_hint = (f" Methods compared in this run: "
+                    f"<code>{h(methods_in_run)}</code>." if methods_in_run else "")
+    out.append(
+        '<div class="description" style="font-style: normal;">'
+        f"<p>We train a neural-network classifier on "
+        f"<strong>{h(dataset_name)}</strong>{h(classes_hint)}.{arch_hint} "
+        "While training, we record the network's full parameter vector "
+        "at recorded snapshots, producing a trajectory through weight "
+        "space. Nothing in the DMD pipeline below depends on the "
+        "network architecture &mdash; swap the model and everything "
+        "re-runs unchanged.</p>"
+        "<p>DMD-family methods take the <strong>fit window</strong> "
+        "portion of that trajectory and learn a low-rank linear model "
+        "of how the weights evolve. We then ask each method to "
+        "<em>extrapolate</em> the trajectory through the rest of "
+        "training (the <strong>forecast region</strong>) without "
+        "seeing those checkpoints during fitting."
+        f"{methods_hint}</p>"
+        "<p>At every recorded step we evaluate two networks on the "
+        "<em>test</em> set: the <strong>real neural network</strong> "
+        "(the genuine trained weights at that step) and the "
+        "<strong>forecasted neural network</strong> (the DMD-predicted "
+        "weights at the same step). Comparing the two tells us how "
+        "faithfully each method captures real training dynamics.</p>"
+        "<p><strong>How to read the plots.</strong> The dashed vertical "
+        "line is the fit/forecast split. To the left of it the forecast "
+        "was trained to match the real curve; to the right it has to "
+        "predict without help. A good method tracks the real curve "
+        "closely on <em>both</em> sides. In the eigenvalue plot, "
+        "eigenvalues inside the unit circle ⇒ stable forecast; outside ⇒ "
+        "the forecast eventually diverges.</p>"
+        "</div>")
+    out.append("<h3>Metric glossary</h3>")
+    out.append('<p class="note">Every test-set metric in the tables and '
+               "plots below is defined here. All accuracies / precisions / "
+               "recalls / F1 scores live in [0, 1].</p>")
+    out.append(_metric_glossary_html())
+
+    # ----- 3. Real neural network headline -----
+    actual_block = metrics.get("__actual__")
+    if actual_block:
+        out.append("<h2>Real neural network — final test performance</h2>")
+        out.append(
+            '<p class="note">The genuine trained classifier evaluated on the '
+            f"{h(dataset_name)} test set at the <strong>last</strong> recorded "
+            "training step. These are the reference numbers every forecast is "
+            "compared against.</p>")
+        out.append("<table>")
+        out.append("<thead><tr>")
+        for key, header in _TEST_METRICS:
+            out.append(f"<th>{h(header)}</th>")
+        out.append("</tr></thead><tbody><tr>")
+        for key, _ in _TEST_METRICS:
+            v = actual_block.get(f"{key}_final")
+            out.append(f"<td class='num'>{h(_fmt_cell(key, v))}</td>")
+        out.append("</tr></tbody></table>")
+
+        cm = actual_block.get("cm_final")
+        if _is_confusion_matrix(cm):
+            out.append("<h3>Confusion matrix at the final step "
+                       "<span class='note' style='font-weight:normal;'>"
+                       "(rows = true class, columns = predicted class; "
+                       "diagonal = correct, off-diagonal = mistakes)"
+                       "</span></h3>")
+            out.append(_render_confusion_table(cm, h))
+
+    # ----- 4. Forecasted networks: final test performance per method -----
+    has_pred = any("pred_loss_final" in metrics.get(mth, {}) for mth in methods)
+    if has_pred:
+        out.append("<h2>Forecasted neural networks — final test performance "
+                   "by method</h2>")
+        out.append(
+            '<p class="note">For each method, we load the <em>forecasted</em> '
+            "weights at the final training step into the same network and "
+            "evaluate on the test set. The <code>Δ</code> column for loss / "
+            "accuracy is <code>forecast − real</code>: a small magnitude "
+            "(close to 0) means the forecast lands near the real network's "
+            "performance. Loss <code>Δ</code> &gt; 0 ⇒ forecast under-performs; "
+            "accuracy <code>Δ</code> &gt; 0 ⇒ forecast over-shoots.</p>")
+        out.append("<table>")
+        out.append("<thead><tr>")
+        out.append("<th>Method</th>")
+        out.append("<th>loss</th><th>Δloss</th>")
+        out.append("<th>accuracy</th><th>Δacc</th>")
+        out.append("<th>precision</th><th>recall</th><th>F1</th>")
+        out.append("</tr></thead><tbody>")
+        for method in methods:
+            m = metrics.get(method, {})
+            out.append("<tr>")
+            out.append(f'<td class="method-cell"><code>{h(method)}</code></td>')
+            for key in ("loss", "accuracy"):
+                pf  = m.get(f"pred_{key}_final")
+                gap = m.get(f"gap_{key}_final")
+                out.append(f"<td class='num'>{h(_fmt_cell(key, pf))}</td>")
+                out.append(f"<td class='num'>{h(_fmt_cell(f'gap_{key}', gap))}</td>")
+            for key in ("precision", "recall", "f1"):
+                pf = m.get(f"pred_{key}_final")
+                out.append(f"<td class='num'>{h(_fmt_cell(key, pf))}</td>")
+            out.append("</tr>")
+        out.append("</tbody></table>")
+
+        # Per-method confusion matrix at the same (final) step. Laid out
+        # in a responsive grid so they sit side-by-side on wide screens
+        # and reflow to one-per-row on narrow ones. Compare against the
+        # real network's confusion matrix in section 3 - the *pattern*
+        # of off-diagonal mass is what reveals which classes the
+        # forecast struggles with.
+        pred_cms = [(m, metrics.get(m, {}).get("pred_cm_final"))
+                    for m in methods]
+        pred_cms = [(m, cm) for m, cm in pred_cms if _is_confusion_matrix(cm)]
+        if pred_cms:
+            out.append("<h3>Confusion matrix at the final step — per method "
+                       "<span class='note' style='font-weight:normal;'>"
+                       "(rows = true class, columns = predicted class). "
+                       "Compare the off-diagonal pattern against the real "
+                       "network above: which classes does each forecast "
+                       "trip up on?</span></h3>")
+            out.append('<div class="cm-strip">')
+            for method, cm in pred_cms:
+                out.append("<div>")
+                out.append(f"<h4><code>{h(method)}</code> — "
+                           f"{h(_method_label(method))}</h4>")
+                out.append(_render_confusion_table(cm, h))
+                out.append("</div>")
+            out.append("</div>")
+
+    # ----- 5. Operator stability + cost -----
+    out.append("<h2>Operator stability &amp; runtime cost</h2>")
+    out.append(
+        '<p class="note">Each method fits a low-rank linear operator <code>A</code>; '
+        "<strong>rank</strong> is its size, <strong>spectral ρ</strong> is the "
+        "magnitude of its largest eigenvalue, and <strong>λ&gt;1</strong> counts "
+        "eigenvalues outside the unit circle. ρ ≤ 1 and λ&gt;1 = 0 ⇒ the forecast "
+        "is bounded; otherwise the forecast will grow exponentially. "
+        "<strong>LM iters / stop</strong> show how the variable-projection "
+        "Levenberg–Marquardt solver terminated for OptDMDc/cOptDMDc. "
+        "<strong>Wall (s)</strong> is the analyse-time cost.</p>")
     out.append("<table>")
-    out.append("<thead><tr>")
-    out.append("<th>Method</th>")
-    for _, header in _SUMMARY_KEYS:
+    out.append("<thead><tr><th>Method</th>")
+    for _, header in _STABILITY_KEYS:
         out.append(f"<th>{h(header)}</th>")
     out.append("</tr></thead><tbody>")
     for method in methods:
         m = metrics.get(method, {})
         out.append("<tr>")
         out.append(f'<td class="method-cell"><code>{h(method)}</code></td>')
-        for key, _ in _SUMMARY_KEYS:
+        for key, _ in _STABILITY_KEYS:
             v = m.get(key)
             cls = _classify_cell(key, v)
-            out.append(f'<td class="{cls}">{h(_fmt_cell(key, v))}</td>')
+            out.append(f"<td class='{cls}'>{h(_fmt_cell(key, v))}</td>")
         out.append("</tr>")
     out.append("</tbody></table>")
 
-    # --- forecast-region final / min ---
-    has_forecast = any(any(k in metrics.get(m, {}) for k, _ in _FORECAST_KEYS)
-                       for m in methods)
-    if has_forecast:
-        out.append("<h2>Forecast-region final / min</h2>")
-        out.append('<p class="note">Predicted vs actual at the <strong>last</strong> '
-                   "forecast snapshot, and the <strong>minimum</strong> over the "
-                   "forecast region. Useful for spotting whether a method's "
-                   "prediction stays near the true loss / accuracy or drifts.</p>")
-        out.append("<table>")
-        out.append("<thead><tr><th>Method</th>")
-        for _, header in _FORECAST_KEYS:
-            out.append(f"<th>{h(header)}</th>")
-        out.append("</tr></thead><tbody>")
-        for method in methods:
-            m = metrics.get(method, {})
-            out.append("<tr>")
-            out.append(f'<td class="method-cell"><code>{h(method)}</code></td>')
-            for key, _ in _FORECAST_KEYS:
-                v = m.get(key)
-                cls = _classify_cell(key, v)
-                out.append(f'<td class="{cls}">{h(_fmt_cell(key, v))}</td>')
-            out.append("</tr>")
-        out.append("</tbody></table>")
-
-    # --- eigenvalue stability ---
-    out.append("<h2>Eigenvalue stability</h2>")
-    for method in methods:
-        m = metrics.get(method, {})
-        n_out = int(m.get("n_outside", 0) or 0)
-        sr    = m.get("spectral_radius", float("nan"))
-        if n_out:
-            out.append(f"<h3><code>{h(method)}</code> — {n_out} eigenvalue(s) "
-                       "outside unit circle</h3>")
+    # Per-method unstable-eigenvalue list (only when n_outside > 0). LM
+    # residuals appear inline below if available - one block per method
+    # that has them.
+    unstable_methods = [m for m in methods
+                        if int(metrics.get(m, {}).get("n_outside", 0) or 0) > 0]
+    lm_methods = [m for m in methods
+                  if "lm_initial_residual" in metrics.get(m, {})]
+    if unstable_methods or lm_methods:
+        out.append("<h3>Per-method stability details</h3>")
+        for method in unstable_methods:
+            m = metrics[method]
+            n_out = int(m.get("n_outside", 0))
+            out.append(f"<h4><code>{h(method)}</code> — {n_out} "
+                       "eigenvalue(s) outside the unit circle</h4>")
             out.append('<ul class="eigvals">')
             for ev in m.get("outside_top", [])[:10]:
                 idx  = ev.get("index", "?")
@@ -900,20 +1279,28 @@ def write_summary() -> None:
                     f"<li>λ<sub>{h(str(idx))}</sub> = {re_v:+.6f}{im_v:+.6f}j  "
                     f"|λ|={mag:.6f}  excess={exc:+.3e}</li>")
             out.append("</ul>")
-        else:
-            sr_str = f"{sr:.6f}" if isinstance(sr, (int, float)) else str(sr)
-            out.append('<div class="stable-note">'
-                       f'<code>{h(method)}</code>: all eigenvalues inside unit circle '
-                       f'(spectral radius {sr_str}).</div>')
+        for method in lm_methods:
+            m  = metrics[method]
+            ri = m.get("lm_initial_residual", float("nan"))
+            rf = m.get("lm_final_residual",   float("nan"))
+            it = m.get("lm_iters", "?")
+            rs_ = m.get("lm_restarts", 0)
+            out.append(
+                '<div class="lm-note">'
+                f"<code>{h(method)}</code> LM: residual "
+                f"{_fmt_cell('loss', ri)} → {_fmt_cell('loss', rf)}  "
+                f"({h(str(it))} iters, {h(str(rs_))} restarts)</div>")
 
-    # --- rank scan diagnostics (if the auto scan ran) ---
+    # ----- 6. Rank scan diagnostics -----
     rs = metrics.get("__rank_scan__")
     if rs:
-        out.append("<h2>LM rank scan</h2>")
-        out.append('<p class="note">Held-out forecast scan over candidate '
-                   "ranks; lowest validation L2 error wins. The chosen rank "
-                   "was patched into <code>METHOD_PARAMS</code> for both "
-                   "<code>optdmdc</code> and <code>coptdmdc</code>.</p>")
+        out.append("<h2>Rank scan (auto-selected LM rank)</h2>")
+        out.append(
+            '<p class="note">Before fitting OptDMDc / cOptDMDc, we sweep '
+            "a list of candidate ranks and pick the one whose held-out "
+            "forecast has the lowest relative L2 error. The chosen rank "
+            "is patched into <code>METHOD_PARAMS</code> for both LM methods. "
+            "The shaded row below is the winner.</p>")
         out.append('<dl class="meta">')
         out.append(f"<dt>Best rank</dt><dd><code>{h(str(rs.get('best_rank')))}</code></dd>")
         bve = rs.get("best_val_err")
@@ -930,37 +1317,49 @@ def write_summary() -> None:
             out.append("<thead><tr><th>Candidate rank</th>"
                        "<th>Validation rel. L2 error</th></tr></thead><tbody>")
             for entry in history:
-                r = entry.get("rank")
-                e = entry.get("val_rel_err")
-                cls = ' class="best-rank"' if r == best_rank else ""
+                r_ = entry.get("rank")
+                e  = entry.get("val_rel_err")
+                cls = ' class="best-rank"' if r_ == best_rank else ""
                 out.append(
                     f"<tr{cls}>"
-                    f"<td class='num'><code>{h(str(r))}</code></td>"
+                    f"<td class='num'><code>{h(str(r_))}</code></td>"
                     f"<td class='num'>{h(_fmt_cell('val_err', e))}</td>"
                     "</tr>")
             out.append("</tbody></table>")
 
-    # --- LM convergence ---
-    lm_methods = [m for m in methods
-                  if "lm_initial_residual" in metrics.get(m, {})]
-    if lm_methods:
-        out.append("<h2>LM convergence</h2>")
-        for method in lm_methods:
-            m = metrics[method]
-            ri = m.get("lm_initial_residual", "?")
-            rf = m.get("lm_final_residual", "?")
-            it = m.get("lm_iters", "?")
-            rs = m.get("lm_restarts", 0)
-            out.append('<div class="lm-note">'
-                       f"<code>{h(method)}</code>: residual {ri:.6e} → {rf:.6e}  "
-                       f"({it} iters, {rs} restarts)</div>")
-
-    # --- plots (PNGs embedded as base64 data URLs) ---
+    # ----- 7. Plots -----
     out.append("<h2>Plots</h2>")
+
+    # Cross-method overlay first: answers "which method tracks best?"
+    # at a glance, before drilling into per-method detail below.
+    overlay = exp_dir() / "plots" / "overlay" / "combined.png"
+    if overlay.exists():
+        out.append("<h3>Cross-method overlay</h3>")
+        out.append(
+            '<p class="note">One panel per network: the real one at the top, '
+            "then each method's forecast below it. Inside every panel, four "
+            "classification metrics (accuracy / precision / recall / F1, left "
+            "axis, in [0, 1]) plus test loss (right axis, dashed) are plotted "
+            "against training step. Compare panels to see which method most "
+            "closely reproduces the real network's curve shape.</p>")
+        b64 = base64.b64encode(overlay.read_bytes()).decode("ascii")
+        out.append('<section class="method-plots"><div class="plot">')
+        out.append(f'<img src="data:image/png;base64,{b64}" '
+                   'alt="cross-method overlay">')
+        out.append("</div></section>")
+
+    # Per-method PNG grid. Skip 'parameter-vector accuracy' for users
+    # who only ran the cls/loss subset (file simply won't exist).
+    if methods:
+        out.append("<h3>Per-method plots</h3>")
+        out.append(
+            '<p class="note">Each section drills into one DMD method: '
+            "real vs forecasted curves over training steps, and the "
+            "spectrum of the linear operator it learned.</p>")
     for method in methods:
         out.append('<section class="method-plots">')
-        out.append(f"<h3><code>{h(method)}</code></h3>")
-        for kind in ("loss", "accuracy", "eigenvalues"):
+        out.append(f"<h4><code>{h(method)}</code> — {h(_method_label(method))}</h4>")
+        for kind in ("loss", "classification", "accuracy", "eigenvalues"):
             p = exp_dir() / "plots" / method / f"{kind}.png"
             if not p.exists():
                 continue
@@ -969,9 +1368,21 @@ def write_summary() -> None:
             out.append(
                 f'<img src="data:image/png;base64,{b64}" '
                 f'alt="{h(method)} {h(kind)}">')
-            out.append(f'<div class="plot-caption">{h(method)} — {h(kind)}</div>')
+            cap = _PLOT_CAPTIONS.get(kind, kind)
+            out.append(f'<div class="plot-caption">{h(cap)}</div>')
             out.append("</div>")
         out.append("</section>")
+
+    # ----- 8. Full configuration snapshot (collapsible) -----
+    out.append("<h2>Full configuration</h2>")
+    out.append('<p class="note">Every tunable knob at the moment this '
+               "experiment was launched. The training-relevant subset "
+               "(<code>DATASET</code>, <code>ARCH</code>, <code>EPOCHS</code>, "
+               "<code>LR</code>, <code>BATCH_SIZE</code>, <code>SEED</code>, "
+               "<code>NOISE_SIGMA</code>, fit window) determines the "
+               "<code>data_hash</code>; everything else is an analysis-time "
+               "choice.</p>")
+    out.append(_render_config_dump(h))
 
     out.append("</main></body></html>")
 

@@ -76,7 +76,9 @@ def main():
                         help=("comma-separated operations to run from "
                               + ",".join(_OPS_ORDER) + " (default: all)"))
     parser.add_argument("--skip-loss",   action="store_true",
-                        help="shortcut for --only analyze,plot_eigenvalues,plot_accuracy")
+                        help="shortcut for --only analyze,plot_eigenvalues,plot_accuracy "
+                             "(skips both plot_loss and plot_classification - they share "
+                             "the per-checkpoint forward-pass cost)")
     parser.add_argument("--force-train", action="store_true",
                         help="retrain even if data cache hit")
     args = parser.parse_args()

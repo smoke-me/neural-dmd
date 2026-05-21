@@ -1,14 +1,49 @@
 """
-Shared matplotlib helper for the DMDc comparison plots.
+Shared matplotlib helpers.
 
-`comparison_plot` draws a two-curve figure (actual vs predicted) with a
-shaded fit region, a vertical fit/forecast split line, and a footer
-summarising the in-sample / out-of-sample mismatch. Used by both plot.py
-(loss) and eval.py (accuracy).
+`comparison_plot`           two-curve figure (actual vs predicted) with
+                            shaded fit region + fit/forecast split.
+                            Used by plot_loss / plot_accuracy.
+`eigenvalue_plot`           |λ| scatter on the unit circle.
+`classification_grid_plot`  2x2 grid of accuracy / precision / recall /
+                            F1, each panel showing the actual vs the
+                            predicted network for one method.
+`combined_overlay_plot`     One figure with N+1 stacked panels (actual
+                            + each method); each panel overlays the
+                            four classification metrics + loss over
+                            training steps, with the fit/forecast split.
+
+All four plot helpers share the same colour vocabulary
+(_PALETTE_ACTUAL / _PALETTE_PRED / _METRIC_COLORS) so plots from
+different ops read consistently in the summary.html report.
 """
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+
+# Palette shared across plots.
+_C_ACTUAL = "#5ed3d3"   # cyan
+_C_PRED   = "#ffb27a"   # warm orange
+_C_SPLIT  = "#ffffff"   # fit/forecast separator
+
+# Per-metric colours used by the classification grid + combined overlay.
+# Keys match runners._CURVE_METRICS so callers can index by metric name.
+_METRIC_COLORS = {
+    "loss":      "#c084fc",   # violet
+    "accuracy":  "#5ed3d3",   # cyan
+    "precision": "#ffb27a",   # orange
+    "recall":    "#fb7185",   # rose
+    "f1":        "#86efac",   # mint
+}
+
+_METRIC_DISPLAY = {
+    "loss":      "loss",
+    "accuracy":  "accuracy",
+    "precision": "precision",
+    "recall":    "recall",
+    "f1":        "F1",
+}
 
 
 def comparison_plot(steps, actual, predicted, split, *,
@@ -36,9 +71,9 @@ def comparison_plot(steps, actual, predicted, split, *,
     plt.style.use("dark_background")
     fig, ax = plt.subplots(figsize=(11, 5.2), constrained_layout=True)
 
-    c_actual = "#5ed3d3"     # cyan - actual curve
-    c_pred   = "#ffb27a"     # warm orange - DMDc curve
-    c_fit_bg = "#5ed3d3"     # tint of the fit-region shaded band
+    c_actual = _C_ACTUAL     # cyan - actual curve
+    c_pred   = _C_PRED       # warm orange - DMDc curve
+    c_fit_bg = _C_ACTUAL     # tint of the fit-region shaded band
 
     a = np.asarray(actual,    dtype=float)
     p = np.asarray(predicted, dtype=float)
@@ -233,5 +268,126 @@ def eigenvalue_plot(eigenvalues, *, out_path, title, stable_tol: float = 0.0):
         handletextpad=0.6,
     )
 
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# classification-metric plots
+# ---------------------------------------------------------------------------
+
+def _decorate_split(ax, steps, fit_start_idx, split):
+    """Common decoration: shaded fit band + fit/forecast split line(s).
+    Shared by classification_grid_plot and combined_overlay_plot so
+    every panel reads the same way."""
+    split = max(int(split), int(fit_start_idx) + 1)
+    fit_left_x  = steps[int(fit_start_idx)]
+    fit_right_x = steps[split - 1]
+    ax.axvspan(fit_left_x, fit_right_x, color=_C_ACTUAL, alpha=0.06, lw=0)
+    ax.axvline(fit_right_x, color=_C_SPLIT, ls="--", lw=1.4, alpha=0.65)
+    if int(fit_start_idx) > 0:
+        ax.axvline(fit_left_x, color=_C_SPLIT, ls="--", lw=1.0, alpha=0.45)
+    return fit_left_x, fit_right_x
+
+
+def classification_grid_plot(steps, actual, pred, split, *,
+                             fit_start_idx,
+                             out_path, title,
+                             actual_label="real network",
+                             pred_label="forecast"):
+    """2x2 panel grid of accuracy / precision / recall / F1.
+    `actual` and `pred` are dicts keyed by metric name (matching
+    runners._CURVE_METRICS). Each panel overlays the actual curve and
+    the predicted curve with the same fit/forecast decoration as
+    comparison_plot."""
+    plt.style.use("dark_background")
+    metrics_layout = [
+        ("accuracy",  "test accuracy"),
+        ("precision", "macro precision"),
+        ("recall",    "macro recall"),
+        ("f1",        "macro F1"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 7.2),
+                              constrained_layout=True, sharex=True)
+
+    for ax, (key, ylabel) in zip(axes.flat, metrics_layout):
+        a = np.asarray(actual[key], dtype=float)
+        p = np.asarray(pred[key],   dtype=float)
+        _decorate_split(ax, steps, fit_start_idx, split)
+        ax.plot(steps, a, color=_C_ACTUAL, lw=2.0, label=actual_label)
+        ax.plot(steps, p, color=_C_PRED,   lw=1.8, ls="--", label=pred_label)
+        ax.set_ylabel(ylabel)
+        ax.set_ylim(-0.02, 1.02)
+        ax.grid(alpha=0.18)
+
+    for ax in axes[-1, :]:
+        ax.set_xlabel(r"training step  $k$")
+
+    # one legend for the whole grid (top-right panel)
+    axes[0, 1].legend(frameon=False, loc="lower right")
+    fig.suptitle(title, fontsize=11)
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
+
+
+def combined_overlay_plot(steps, panels, split, *,
+                          fit_start_idx,
+                          metric_keys,
+                          out_path, title):
+    """Stacked-panel figure: one row per (label, curve) entry in
+    `panels` (typically: ("actual", actual_curve) followed by one entry
+    per DMD method). Within each panel the four classification metrics
+    + the test loss are drawn as separate lines over training steps.
+
+    `metric_keys` is the canonical ordering of metric names (matching
+    runners._CURVE_METRICS); curves are dicts whose keys include these.
+
+    Loss is plotted on a secondary y-axis (right) so the [0, 1] cls
+    metrics retain their natural scale on the primary axis - mixing
+    them on one axis squashes the cls curves into a thin band when
+    loss starts near 2 (e.g. uniform 10-way softmax).
+    """
+    plt.style.use("dark_background")
+    n_rows = len(panels)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(13.5, 2.4 * n_rows + 0.6),
+                              sharex=True, constrained_layout=True,
+                              squeeze=False)
+    axes = axes[:, 0]
+
+    twin_axes = []
+    for ax, (label, curve) in zip(axes, panels):
+        _decorate_split(ax, steps, fit_start_idx, split)
+        for key in metric_keys:
+            if key == "loss":
+                continue
+            y = np.asarray(curve[key], dtype=float)
+            ax.plot(steps, y, color=_METRIC_COLORS[key], lw=1.6,
+                    label=_METRIC_DISPLAY[key])
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_ylabel(f"{label}\n[cls metrics]", fontsize=9)
+        ax.grid(alpha=0.18)
+
+        ax2 = ax.twinx()
+        L = np.asarray(curve["loss"], dtype=float)
+        ax2.plot(steps, L, color=_METRIC_COLORS["loss"], lw=1.4, ls="--",
+                 label=_METRIC_DISPLAY["loss"])
+        ax2.set_ylabel("loss", fontsize=8, color=_METRIC_COLORS["loss"])
+        ax2.tick_params(axis="y", labelcolor=_METRIC_COLORS["loss"])
+        ax2.spines["right"].set_color(_METRIC_COLORS["loss"])
+        twin_axes.append(ax2)
+
+    # Shared legend across the top: cls handles from first panel's
+    # primary axis + the loss handle from its twin.
+    handles, labels = axes[0].get_legend_handles_labels()
+    h2, l2 = twin_axes[0].get_legend_handles_labels()
+    handles += h2
+    labels  += l2
+    axes[0].legend(handles, labels,
+                   ncol=len(handles), loc="upper center",
+                   bbox_to_anchor=(0.5, 1.28),
+                   frameon=False, fontsize=9)
+
+    axes[-1].set_xlabel(r"training step  $k$")
+    fig.suptitle(title, fontsize=11, y=1.02)
     fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
