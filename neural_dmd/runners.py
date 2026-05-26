@@ -63,6 +63,62 @@ from .snapshots import Recorder, eval_indices
 # analyze
 # ---------------------------------------------------------------------------
 
+def _wrap_with_normalization(snap: dict):
+    """If config.SNAPSHOT_NORM != "off", return a new snap dict whose X
+    is normalized per-tensor, plus a denormalizer callable to apply to
+    the resulting X_pred. The original snap[X] is left untouched so
+    eval / plot read genuine trained weights.
+
+    Returns
+    -------
+    (snap_out, denorm)
+        snap_out : dict identical to `snap` except `X` is replaced by
+                   the per-tensor-normalized copy. When normalization is
+                   off, `snap` is returned unchanged.
+        denorm   : Callable[X_pred] -> X_pred_original_space. Identity
+                   when normalization is off; otherwise multiplies each
+                   X_pred column by the recorded per-snapshot per-tensor
+                   scales (so forecast-region columns use the genuine
+                   recorded magnitudes - the comparison isolates DMD's
+                   shape-prediction quality from magnitude drift).
+    """
+    name = str(getattr(C, "SNAPSHOT_NORM", "off"))
+    if name == "off":
+        return snap, (lambda x: x)
+
+    sizes = snap.get("tensor_sizes")
+    if sizes is None or len(sizes) == 0:
+        log("warn",
+            f"do_analyze: SNAPSHOT_NORM='{name}' requested but snapshots "
+            "have no tensor_sizes (legacy npz?). Skipping normalization.")
+        return snap, (lambda x: x)
+
+    from .normalizers import compute_scales, apply_scales
+    sizes = [int(s) for s in sizes]
+    X     = snap["X"]
+    scales = compute_scales(X, sizes, name)                          # (n_tensors, m)
+    X_norm = apply_scales(X, scales, sizes, inverse=False)
+
+    log("info",
+        f"analyze: SNAPSHOT_NORM='{name}' active; normalized X for DMD  "
+        f"n_tensors={len(sizes)}  scale_range=["
+        f"{float(scales.min()):.3e}, {float(scales.max()):.3e}]")
+
+    snap_out = dict(snap)
+    snap_out["X"] = X_norm.astype(X.dtype, copy=False)
+
+    def _denorm(X_pred: np.ndarray) -> np.ndarray:
+        # Apply the matching scale to each column of X_pred. We use the
+        # genuine recorded scale at every snapshot index (including the
+        # forecast region) so the denormalized forecast lives at the
+        # network's actual magnitude trajectory; the test-loss gap then
+        # measures DMD's shape-prediction error only.
+        return apply_scales(X_pred, scales.astype(X_pred.dtype, copy=False),
+                            sizes, inverse=True)
+
+    return snap_out, _denorm
+
+
 def do_analyze(method: str) -> None:
     info = get_method(method)
     runner = info["run"]
@@ -87,10 +143,20 @@ def do_analyze(method: str) -> None:
         f"fit_split={snap['fit_split']}  fit_start_idx={snap['fit_start_idx']}  "
         f"total_steps={snap['total_steps']}")
 
+    # ----- snapshot normalization (analysis-time pre/post-processing) -----
+    # When SNAPSHOT_NORM != "off", DMD fits a normalized copy of X so the
+    # operator captures only weight SHAPE evolution. Predictions are
+    # de-normalized on the way out, so the X_pred we save (and everything
+    # downstream eval / plot consumes) lives in original parameter space.
+    snap, _denorm = _wrap_with_normalization(snap)
+
     t0 = time.time()
     out = runner(snap, **params)
     wall = time.time() - t0
     log("ok", f"{label}: run() finished in {wall:.2f}s")
+
+    # De-normalize X_pred (no-op when SNAPSHOT_NORM == "off")
+    out["X_pred"] = _denorm(out["X_pred"])
 
     eigvals = np.asarray(out.get("eigenvalues",
                                  np.linalg.eigvals(out["A"]))).astype(np.complex128)
@@ -637,6 +703,12 @@ def run_full_pipeline(methods: list[str] | tuple[str, ...] | None = None,
             snap_path = _E.snapshots_path()
             if snap_path.exists():
                 snap = Recorder.load(snap_path)
+                # Apply the same normalization the DMD methods will see,
+                # so the rank selector picks against the SHAPE-only
+                # spectrum when SNAPSHOT_NORM is active. Denormalizer is
+                # unused here - the selector only reads X (no X_pred to
+                # invert).
+                snap, _ = _wrap_with_normalization(snap)
                 selector_name = getattr(C, "RANK_SELECTOR", "fixed")
                 log("info",
                     f"runners: applying rank selector '{selector_name}'")

@@ -161,18 +161,28 @@ FIT_RANGE = (150, 500)    # step-based:    (start_step, end_step) or None
 # inject_snapshot_noise call becomes a no-op.
 NOISE_SIGMA = 0.0
 
-# Per-checkpoint normalization. Name in neural_dmd.normalizers.NORMALIZERS.
-# Removes whole-trajectory drift in weight MAGNITUDE so DMD models only
-# the shape of the parameter tensors over time, not their overall size.
-# Participates in the data_hash (changes invalidate the snapshot cache).
+# Per-checkpoint normalization for the DMD analysis. Name in
+# neural_dmd.normalizers.NORMALIZERS. Removes whole-trajectory drift in
+# weight MAGNITUDE so DMD models only the shape of the parameter tensors
+# over time, not their overall size.
 #
-#   "off"         No rescaling (default; flatten_params verbatim).
-#   "per_tensor"  Each parameter tensor (every weight matrix, every bias)
-#                 divided by its own L2 norm at record time. Every
-#                 component lives on the unit sphere. Eval-time loading
-#                 of these snapshots evaluates the *normalized* network
-#                 (matches the DMD forecast), so train-loss / test-loss
-#                 plots compare apples-to-apples in normalized space.
+# IMPORTANT: snapshots on disk stay UN-normalized regardless of this
+# knob - it is applied as an analysis-time pre/post-processing step
+# around each DMD method (see neural_dmd.runners.do_analyze):
+#   * X_fit normalized per-tensor before the DMD fit (operator learns shape).
+#   * X_pred denormalized per-tensor on the way out (eval / plot pipelines
+#     see genuine, original-scale weights, so real and forecasted
+#     network test-loss curves are physically meaningful).
+# Flipping this knob does NOT invalidate the snapshot data_hash; you can
+# re-analyse the same cached snapshots under different normalizers.
+#
+#   "off"         No rescaling. DMD fits original-scale weights directly.
+#   "per_tensor"  Each parameter tensor divided by its own L2 norm column
+#                 by column. DMD operates on a unit-norm copy; predictions
+#                 are scaled back using the recorded per-snapshot scales
+#                 (forecast-region scales come from the recorded out-of-fit
+#                 snapshots, so the comparison isolates shape error from
+#                 magnitude drift).
 SNAPSHOT_NORM = "per_tensor"
 
 # ---------------------------------------------------------------------------

@@ -35,7 +35,6 @@ for every step in the forecast region too.
 import numpy as np
 
 from .log import log
-from .normalizers import get as _get_normalizer
 from .params import flatten_params
 
 
@@ -93,10 +92,12 @@ class Recorder:
         # total_steps     : total training steps; controls list will have
         #                   length total_steps - 1
         # control_fn      : (optimizer, step) -> 1-D iterable of floats
-        # normalizer      : name in neural_dmd.normalizers.NORMALIZERS used
-        #                   to rescale each parameter snapshot before storing.
-        #                   "off" reproduces the historical (flatten_params)
-        #                   behaviour byte-for-byte.
+        # normalizer      : name in neural_dmd.normalizers.NORMALIZERS;
+        #                   stored as metadata only - snapshots are always
+        #                   recorded in original (un-normalized) form so
+        #                   eval / plot can load genuine trained weights.
+        #                   Normalization is applied as a pre/post-processing
+        #                   step around DMD methods in runners.do_analyze.
         if not (0 <= fit_start_step < fit_end_step <= total_steps):
             raise ValueError(
                 f"invalid fit window: fit_start_step={fit_start_step}  "
@@ -108,11 +109,11 @@ class Recorder:
         self.total_steps     = total_steps
         self.control_fn      = control_fn
         self.normalizer_name = str(normalizer)
-        self._normalize      = _get_normalizer(self.normalizer_name)
 
         self.X: list[np.ndarray] = []
         self.U: list[list[float]] = []
         self.steps: list[int] = []
+        self.tensor_sizes: list[int] = []   # populated on first step
         self._k = 0
 
     def _is_snapshot_step(self, k: int) -> bool:
@@ -129,8 +130,10 @@ class Recorder:
         # always records the control vector u_k (so U is dense across the run).
         k = self._k
         if self._is_snapshot_step(k):
-            self.X.append(self._normalize(model))
+            self.X.append(flatten_params(model))
             self.steps.append(k)
+            if not self.tensor_sizes:
+                self.tensor_sizes = [int(p.numel()) for p in model.parameters()]
         self.U.append(list(self.control_fn(optimizer, k)))
         self._k += 1
 
@@ -155,6 +158,8 @@ class Recorder:
             "fit_start_step": int(npz["fit_start_step"]) if "fit_start_step" in keys else 0,
             "fit_start_idx":  int(npz["fit_start_idx"])  if "fit_start_idx"  in keys else 0,
             "normalizer":     (str(npz["normalizer"]) if "normalizer" in keys else "off"),
+            "tensor_sizes":   (np.asarray(npz["tensor_sizes"], dtype=np.int64)
+                               if "tensor_sizes" in keys else None),
         }
         return out
 
@@ -183,4 +188,5 @@ class Recorder:
             fit_every=np.int64(self.fit_every),
             forecast_every=np.int64(self.forecast_every),
             normalizer=np.array(self.normalizer_name),
+            tensor_sizes=np.asarray(self.tensor_sizes, dtype=np.int64),
         )
