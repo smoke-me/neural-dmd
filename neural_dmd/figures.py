@@ -46,28 +46,28 @@ _METRIC_DISPLAY = {
 }
 
 
-def comparison_plot(steps, actual, predicted, split, *,
+def comparison_plot(steps, actual, predicted, *,
                     out_path, title, ylabel,
                     actual_label, pred_label, summary_label,
-                    fit_start_idx: int = 0,
+                    fit_start_step: int,
+                    fit_end_step: int,
                     y_clip: tuple | None = None,
                     auto_clip_factor: float = 10.0):
-    # steps         : (m,) x-axis (training step index of each snapshot)
-    # actual        : (m,) y-values from the real x_k
-    # predicted     : (m,) y-values from the DMDc forecast x_hat_k
-    # split         : snapshot index where fit ends (one past the last
-    #                 fit-region snapshot, i.e. fit_split / fit_end_idx)
-    # fit_start_idx : snapshot index where fit begins; defaults to 0 for
-    #                 the historical FIT_RANGE = None case
-    # title, ylabel : figure decoration
-    # *_label       : strings shown in legend / x-axis footer
-    # y_clip        : explicit (y_lo, y_hi) bounds. None -> auto-clip when
-    #                 predicted dwarfs actual (see auto_clip_factor).
+    # steps           : (m,) x-axis (gradient-step index of each grid point)
+    # actual          : (m,) y-values from the real x_k
+    # predicted       : (m,) y-values from the DMDc forecast x_hat_k
+    # fit_start_step  : gradient step where the fit window begins (drawn
+    #                   as the left vertical guide when > min(steps))
+    # fit_end_step    : gradient step where the fit window ends (= first
+    #                   forecast step; drawn as the fit/forecast split).
+    # title, ylabel   : figure decoration
+    # *_label         : strings shown in legend / x-axis footer
+    # y_clip          : explicit (y_lo, y_hi) bounds. None -> auto-clip
+    #                   when predicted dwarfs actual.
     # auto_clip_factor: when |predicted|.max() exceeds this multiple of
-    #                 |actual|.max(), or when predicted has any non-finite
-    #                 values, clip y-axis to a window around actual's
-    #                 range so the actual curve stays readable. Off-scale
-    #                 predicted points are flagged in an inset.
+    #                   |actual|.max(), or when predicted has any non-
+    #                   finite values, clip y-axis to a window around
+    #                   actual's range so the actual curve stays readable.
     plt.style.use("dark_background")
     fig, ax = plt.subplots(figsize=(11, 5.2), constrained_layout=True)
 
@@ -77,10 +77,14 @@ def comparison_plot(steps, actual, predicted, split, *,
 
     a = np.asarray(actual,    dtype=float)
     p = np.asarray(predicted, dtype=float)
-    m = len(steps)
-    split = max(int(split), fit_start_idx + 1)
-    fit_left_x  = steps[fit_start_idx]
-    fit_right_x = steps[split - 1]
+    steps_arr = np.asarray(steps)
+    m = len(steps_arr)
+    # X positions for fit-window boundaries: use the gradient-step
+    # numbers DIRECTLY (not steps[idx]), so the lines and the shaded
+    # band land exactly on the configured fit window even when the eval
+    # grid skips over the boundary value.
+    fit_left_x  = float(fit_start_step)
+    fit_right_x = float(fit_end_step)
 
     # Shaded background for the fit window only.
     ax.axvspan(fit_left_x, fit_right_x, color=c_fit_bg, alpha=0.06, lw=0)
@@ -91,12 +95,12 @@ def comparison_plot(steps, actual, predicted, split, *,
 
     # Right-side fit/forecast split (always drawn).
     ax.axvline(fit_right_x, color="#ffffff", ls="--", lw=1.6, alpha=0.7,
-               label=f"fit / forecast split  (k={fit_right_x})")
+               label=f"fit / forecast split  (k={int(fit_right_x)})")
     # Left-side fit-window boundary (only when the fit window does not
     # start at step 0, i.e. when FIT_RANGE was set).
-    if fit_start_idx > 0:
+    if fit_start_step > (int(steps_arr[0]) if m > 0 else 0):
         ax.axvline(fit_left_x, color="#ffffff", ls="--", lw=1.2, alpha=0.5,
-                   label=f"pre-fit boundary  (k={fit_left_x})")
+                   label=f"pre-fit boundary  (k={int(fit_left_x)})")
 
     # ----- y-axis clipping -----
     # If predicted explodes (NaN / inf / huge magnitude vs actual), clip
@@ -155,9 +159,10 @@ def comparison_plot(steps, actual, predicted, split, *,
 
     # Footer: mean absolute mismatch within / outside the fit window.
     # Use nanmean and skip non-finite points so a single overflowed
-    # value doesn't poison the whole summary.
-    in_mask = np.zeros(m, dtype=bool)
-    in_mask[fit_start_idx:split] = True
+    # value doesn't poison the whole summary. Membership is keyed on
+    # the gradient-step boundaries directly so the mask agrees with
+    # the visually drawn shaded band.
+    in_mask  = (steps_arr >= fit_start_step) & (steps_arr < fit_end_step)
     out_mask = ~in_mask
     def _safe_mean(mask):
         diff = np.abs(p[mask] - a[mask])
@@ -276,22 +281,23 @@ def eigenvalue_plot(eigenvalues, *, out_path, title, stable_tol: float = 0.0):
 # classification-metric plots
 # ---------------------------------------------------------------------------
 
-def _decorate_split(ax, steps, fit_start_idx, split):
+def _decorate_split(ax, *, fit_start_step, fit_end_step, draw_left=True):
     """Common decoration: shaded fit band + fit/forecast split line(s).
-    Shared by classification_grid_plot and combined_overlay_plot so
-    every panel reads the same way."""
-    split = max(int(split), int(fit_start_idx) + 1)
-    fit_left_x  = steps[int(fit_start_idx)]
-    fit_right_x = steps[split - 1]
+    X positions are gradient-step numbers (matching the snapshot
+    metadata), so the lines land exactly on the configured fit window
+    no matter how the eval grid is sampled."""
+    fit_left_x  = float(fit_start_step)
+    fit_right_x = float(fit_end_step)
     ax.axvspan(fit_left_x, fit_right_x, color=_C_ACTUAL, alpha=0.06, lw=0)
     ax.axvline(fit_right_x, color=_C_SPLIT, ls="--", lw=1.4, alpha=0.65)
-    if int(fit_start_idx) > 0:
+    if draw_left and fit_left_x > 0:
         ax.axvline(fit_left_x, color=_C_SPLIT, ls="--", lw=1.0, alpha=0.45)
     return fit_left_x, fit_right_x
 
 
-def classification_grid_plot(steps, actual, pred, split, *,
-                             fit_start_idx,
+def classification_grid_plot(steps, actual, pred, *,
+                             fit_start_step: int,
+                             fit_end_step:   int,
                              out_path, title,
                              actual_label="real network",
                              pred_label="forecast"):
@@ -313,7 +319,9 @@ def classification_grid_plot(steps, actual, pred, split, *,
     for ax, (key, ylabel) in zip(axes.flat, metrics_layout):
         a = np.asarray(actual[key], dtype=float)
         p = np.asarray(pred[key],   dtype=float)
-        _decorate_split(ax, steps, fit_start_idx, split)
+        _decorate_split(ax,
+                        fit_start_step=fit_start_step,
+                        fit_end_step=fit_end_step)
         ax.plot(steps, a, color=_C_ACTUAL, lw=2.0, label=actual_label)
         ax.plot(steps, p, color=_C_PRED,   lw=1.8, ls="--", label=pred_label)
         ax.set_ylabel(ylabel)
@@ -330,8 +338,9 @@ def classification_grid_plot(steps, actual, pred, split, *,
     plt.close(fig)
 
 
-def combined_overlay_plot(steps, panels, split, *,
-                          fit_start_idx,
+def combined_overlay_plot(steps, panels, *,
+                          fit_start_step: int,
+                          fit_end_step:   int,
                           metric_keys,
                           out_path, title):
     """Stacked-panel figure: one row per (label, curve) entry in
@@ -356,7 +365,9 @@ def combined_overlay_plot(steps, panels, split, *,
 
     twin_axes = []
     for ax, (label, curve) in zip(axes, panels):
-        _decorate_split(ax, steps, fit_start_idx, split)
+        _decorate_split(ax,
+                        fit_start_step=fit_start_step,
+                        fit_end_step=fit_end_step)
         for key in metric_keys:
             if key == "loss":
                 continue

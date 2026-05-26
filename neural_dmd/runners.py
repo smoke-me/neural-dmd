@@ -449,8 +449,9 @@ def do_plot_loss(method: str) -> None:
     fit_split = int(cache["fit_split"])
 
     summary = comparison_plot(
-        grid_steps, actual["loss"], pred["loss"], plot_split,
-        fit_start_idx=fit_start_grid,
+        grid_steps, actual["loss"], pred["loss"],
+        fit_start_step=int(snap.get("fit_start_step", 0)),
+        fit_end_step=int(snap["fit_steps"]),
         out_path=out_path,
         title=f"{label} loss-curve forecast on {C.DATASET.upper()}   "
               f"·   fit on {fit_split - cache.get('fit_start_idx', 0):d} dense snapshots   "
@@ -501,8 +502,9 @@ def do_plot_accuracy(method: str) -> None:
     # 100% reference + the meaningful negative range stay readable; the
     # plot annotates how many points fell off-scale.
     summary = comparison_plot(
-        grid_steps, acc_actual, acc_pred, plot_split,
-        fit_start_idx=fit_start_grid,
+        grid_steps, acc_actual, acc_pred,
+        fit_start_step=int(snap.get("fit_start_step", 0)),
+        fit_end_step=int(snap["fit_steps"]),
         y_clip=(-25.0, 105.0),
         out_path=out_path,
         title=f"{label} parameter-prediction accuracy on {C.DATASET.upper()}   "
@@ -532,8 +534,9 @@ def do_plot_classification(method: str) -> None:
     fit_split = int(cache["fit_split"])
 
     classification_grid_plot(
-        grid_steps, actual, pred, plot_split,
-        fit_start_idx=fit_start_grid,
+        grid_steps, actual, pred,
+        fit_start_step=int(snap.get("fit_start_step", 0)),
+        fit_end_step=int(snap["fit_steps"]),
         out_path=out_path,
         title=f"{label} classification metrics on {C.DATASET.upper()}   "
               f"·   fit on {fit_split - cache.get('fit_start_idx', 0):d} dense snapshots   "
@@ -624,8 +627,9 @@ def do_plot_combined(methods) -> None:
         return
 
     combined_overlay_plot(
-        grid_steps, panels, plot_split,
-        fit_start_idx=fit_start_grid,
+        grid_steps, panels,
+        fit_start_step=int(snap.get("fit_start_step", 0)),
+        fit_end_step=int(snap["fit_steps"]),
         metric_keys=_CURVE_METRICS,
         out_path=out_path,
         title=f"All methods on {C.DATASET.upper()}   ·   "
