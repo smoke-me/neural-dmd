@@ -91,7 +91,12 @@ class Recorder:
         # fit_end_step    : gradient-step boundary; first forecast-region step
         # total_steps     : total training steps; controls list will have
         #                   length total_steps - 1
-        # control_fn      : (optimizer, step) -> 1-D iterable of floats
+        # control_fn      : per-step control producer. Either a
+        #                   neural_dmd.controls.ControlComposer (preferred,
+        #                   exposes .step(model, optimizer, step=, batch=)
+        #                   and .dim / .names_dims) or, for backward
+        #                   compatibility, a plain `(optimizer, step) ->
+        #                   1-D iterable of floats` callable.
         # normalizer      : name in neural_dmd.normalizers.NORMALIZERS;
         #                   stored as metadata only - snapshots are always
         #                   recorded in original (un-normalized) form so
@@ -124,17 +129,29 @@ class Recorder:
         # uniformly on either side of the fit window
         return (k % self.forecast_every) == 0
 
-    def step(self, model, optimizer) -> None:
+    def step(self, model, optimizer, *, batch=None) -> None:
         # Call once per gradient step (after opt.step + sched.step).
         # Records the parameter vector iff this step is on a snapshot grid;
         # always records the control vector u_k (so U is dense across the run).
+        #
+        # `batch` is the (x, y) tuple just used for the optimizer step
+        # (NOT detached at this point - controls that read it should
+        # detach + cpu themselves). Forwarded to control sources that
+        # want it (e.g. batch_pca); ignored by sources that don't.
         k = self._k
         if self._is_snapshot_step(k):
             self.X.append(flatten_params(model))
             self.steps.append(k)
             if not self.tensor_sizes:
                 self.tensor_sizes = [int(p.numel()) for p in model.parameters()]
-        self.U.append(list(self.control_fn(optimizer, k)))
+
+        cf = self.control_fn
+        if hasattr(cf, "step"):
+            u_k = cf.step(model, optimizer, step=k, batch=batch)
+        else:
+            # legacy `(optimizer, step) -> iterable` signature
+            u_k = cf(optimizer, k)
+        self.U.append(list(np.asarray(u_k, dtype=np.float32).ravel()))
         self._k += 1
 
     @staticmethod

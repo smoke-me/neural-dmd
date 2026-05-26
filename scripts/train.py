@@ -39,6 +39,7 @@ from neural_dmd import repro as R
 from neural_dmd.data import get_loaders
 from neural_dmd.log import banner, log, progress
 from neural_dmd.metrics import LOSSES
+from neural_dmd.controls import build_controls
 from neural_dmd.model import MLP
 from neural_dmd.optimizers import build as build_optimizer
 from neural_dmd.schedule import cosine, current_lr
@@ -47,13 +48,16 @@ from neural_dmd.snapshots import Recorder, inject_snapshot_noise
 
 def train_epoch(model, loader, opt, sched, recorder, loss_fn, *,
                 epoch_idx: int, total_epochs: int, base_step: int,
-                device: str):
-    # Run one full pass over the training set. Returns mean loss + accuracy
-    # measured on the training data (NOT a measure of generalisation).
+                device: str, max_global_step: int | None = None):
+    # Run one full pass over the training set (or until the global step
+    # cap is reached). Returns mean loss + accuracy measured on the
+    # training data (NOT a measure of generalisation), plus a bool
+    # indicating whether the cap was hit mid-epoch.
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     n_batches = len(loader)
     t_epoch = time.time()
+    capped = False
 
     for batch_idx, (x, y) in enumerate(loader, start=1):
         x, y = x.to(device), y.to(device)
@@ -65,7 +69,10 @@ def train_epoch(model, loader, opt, sched, recorder, loss_fn, *,
         opt.step()
         sched.step()
 
-        recorder.step(model, opt)
+        # Pass the batch through to the control composer so sources like
+        # batch_pca can summarise it. The composer detaches / moves to
+        # CPU itself - don't pre-process here.
+        recorder.step(model, opt, batch=(x, y))
 
         total_loss += loss.item() * y.size(0)
         correct    += (logits.argmax(dim=1) == y).sum().item()
@@ -74,7 +81,12 @@ def train_epoch(model, loader, opt, sched, recorder, loss_fn, *,
         progress(f"epoch {epoch_idx}/{total_epochs} batches",
                  batch_idx, n_batches, t_epoch, every_pct=25.0)
 
-    return total_loss / total, correct / total
+        if max_global_step is not None and recorder._k >= max_global_step:
+            capped = True
+            break
+
+    denom = max(total, 1)
+    return total_loss / denom, correct / denom, capped
 
 
 # Fit-window resolution lives in neural_dmd.experiments so the training
@@ -149,7 +161,12 @@ def main():
     train_loader, _ = get_loaders(C.DATASET, C.BATCH_SIZE, C.EVAL_BATCH, C.DATA_ROOT,
                                   seed=seed)
 
-    total_steps = C.EPOCHS * len(train_loader)
+    extra_steps = int(getattr(C, "EXTRA_STEPS", 0) or 0)
+    batches_per_epoch = len(train_loader)
+    total_steps = C.EPOCHS * batches_per_epoch + extra_steps
+    # How many outer-loop epochs we need to traverse to reach total_steps;
+    # the trailing epoch breaks early once recorder._k hits the cap.
+    n_outer_epochs = (total_steps + batches_per_epoch - 1) // batches_per_epoch
     fit_start_step, fit_end_step = _resolve_fit_window(total_steps)
     fit_window_len = fit_end_step - fit_start_step
 
@@ -159,10 +176,23 @@ def main():
 
     log("info",
         f"trajectory plan: total_steps={total_steps}  "
+        f"(EPOCHS={C.EPOCHS} * {batches_per_epoch} + EXTRA_STEPS={extra_steps})  "
         f"fit_window=[{fit_start_step}, {fit_end_step})  "
         f"snap_fit_every={C.SNAP_FIT_EVERY} -> ~{n_fit_snaps} fit snaps  "
         f"snap_forecast_every={C.SNAP_FORECAST_EVERY} -> "
         f"~{n_pre_snaps} pre-fit + ~{n_post_snaps} post-fit snaps")
+
+    # ----- build controls composer (precomputes PCA basis if needed) -----
+    controls = build_controls(
+        getattr(C, "CONTROLS", ("lr",)),
+        getattr(C, "CONTROL_PARAMS", {}) or {},
+        setup_ctx={
+            "dataset_name": C.DATASET,
+            "data_root":    C.DATA_ROOT,
+            "seed":         seed,
+            "device":       device,
+        },
+    )
 
     # ----- build model + optimiser + scheduler -----
     model    = MLP(C.ARCH).to(device)
@@ -178,22 +208,27 @@ def main():
         fit_start_step=fit_start_step,
         fit_end_step=fit_end_step,
         total_steps=total_steps,
-        control_fn=C.control_fn,
+        control_fn=controls,
         normalizer=getattr(C, "SNAPSHOT_NORM", "off"),
     )
 
     # ----- train -----
-    for epoch in range(1, C.EPOCHS + 1):
-        loss_v, acc_v = train_epoch(model, train_loader, opt, sched, recorder, loss_fn,
-                                    epoch_idx=epoch, total_epochs=C.EPOCHS,
-                                    base_step=(epoch - 1) * len(train_loader),
-                                    device=device)
+    for epoch in range(1, n_outer_epochs + 1):
+        loss_v, acc_v, capped = train_epoch(
+            model, train_loader, opt, sched, recorder, loss_fn,
+            epoch_idx=epoch, total_epochs=n_outer_epochs,
+            base_step=(epoch - 1) * batches_per_epoch,
+            device=device, max_global_step=total_steps)
         log("ok",
-            f"epoch {epoch}/{C.EPOCHS}  "
+            f"epoch {epoch}/{n_outer_epochs}  "
             f"train_loss={loss_v:.4f}  "
             f"train_acc={acc_v*100:.2f}%  "
             f"lr={current_lr(opt):.2e}  "
-            f"snapshots_so_far={len(recorder.X)}")
+            f"snapshots_so_far={len(recorder.X)}  "
+            f"global_step={recorder._k}/{total_steps}"
+            + ("  (cap reached, ending)" if capped else ""))
+        if capped:
+            break
 
     # ----- persist into the data cache -----
     banner("training done",

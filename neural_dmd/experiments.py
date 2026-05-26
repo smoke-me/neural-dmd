@@ -68,7 +68,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
-import inspect
 import json
 import math
 import os
@@ -96,12 +95,15 @@ TRAIN_FIELDS = (
     "DATASET",
     "ARCH",
     "EPOCHS",
+    "EXTRA_STEPS",
     "BATCH_SIZE",
     "LR",
     "LR_MIN",
     "LOSS",
     "OPTIMIZER",
     "OPTIMIZER_PARAMS",
+    "CONTROLS",
+    "CONTROL_PARAMS",
     "FIT_FRAC",
     "FIT_RANGE",
     "SNAP_FIT_EVERY",
@@ -199,7 +201,8 @@ def train_config_dict() -> dict:
     """
     fields: dict[str, Any] = {}
     for k in TRAIN_FIELDS:
-        if k in ("FIT_FRAC", "FIT_RANGE", "OPTIMIZER_PARAMS"):
+        if k in ("FIT_FRAC", "FIT_RANGE",
+                 "OPTIMIZER_PARAMS", "CONTROL_PARAMS"):
             continue   # handled below
         v = getattr(C, k, None)
         if isinstance(v, list):
@@ -215,6 +218,20 @@ def train_config_dict() -> dict:
     fields["OPTIMIZER_PARAMS"] = {
         k: (tuple(v) if isinstance(v, list) else v)
         for k, v in sorted(opt_kw.items())
+    }
+
+    # CONTROL_PARAMS: same pattern - only kwargs for sources actually
+    # listed in CONTROLS contribute. Editing an inactive entry doesn't
+    # change the snapshot data.
+    ctrl_names = tuple(getattr(C, "CONTROLS", ("lr",)))
+    ctrl_all   = getattr(C, "CONTROL_PARAMS", {}) or {}
+    fields["CONTROLS"] = ctrl_names
+    fields["CONTROL_PARAMS"] = {
+        name: {
+            k: (tuple(v) if isinstance(v, list) else v)
+            for k, v in sorted((ctrl_all.get(name, {}) or {}).items())
+        }
+        for name in ctrl_names
     }
 
     fr = getattr(C, "FIT_RANGE", None)
@@ -235,7 +252,6 @@ def train_config_dict() -> dict:
                               if isinstance(ff, (list, tuple))
                               else float(ff))
 
-    fields["control_fn:source"] = inspect.getsource(C.control_fn)
     return fields
 
 
@@ -386,8 +402,6 @@ def snapshot_full_config() -> dict:
             out[name] = val
         except Exception:
             out[name] = str(val)
-    if callable(getattr(C, "control_fn", None)):
-        out["control_fn:source"] = inspect.getsource(C.control_fn)
     return out
 
 

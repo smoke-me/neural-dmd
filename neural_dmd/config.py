@@ -73,6 +73,11 @@ EVAL_BATCH = 1000             # eval batch size (no grads, can be larger)
 ARCH = [784, 128, 64, 10]
 
 EPOCHS = 5
+# Additional gradient steps to run *after* the full EPOCHS pass. Extends
+# training rightward into the forecast region without changing the
+# fit-window boundary. Total training length is EPOCHS*batches_per_epoch
+# + EXTRA_STEPS. Participates in the data_hash (changing it retrains).
+EXTRA_STEPS = 300
 LR     = 1e-3
 LR_MIN = 0.0                  # cosine-annealing floor
 LOSS   = "cross_entropy"      # name in metrics.LOSSES used for training + plot_loss
@@ -101,17 +106,30 @@ OPTIMIZER_PARAMS: dict[str, dict] = {
 }
 
 
-def control_fn(optimizer, step):
-    """Return the control vector u_k recorded with each gradient step.
+# Per-step control vector u_k for DMDc (driving x_{k+1} = A x_k + B u_k).
+# The control is composed by concatenating the outputs of every source
+# named in CONTROLS, in order, into one (q,) vector. See
+# neural_dmd.controls for the registry of available sources and how to
+# add new ones.
+#
+#   "lr"         scalar learning rate (1 dim). Reproduces the legacy
+#                pre-controls behaviour exactly when used alone.
+#   "batch_pca"  k-dim projection of the current batch's mean image onto
+#                the top-k principal directions of the training set
+#                (computed once at startup). Exposes "what kind of data
+#                drove this step" to DMDc so its B matrix can map batch
+#                content to weight-update direction.
+#
+# Per-source kwargs go in CONTROL_PARAMS[name]. Only the entries for
+# active sources (those listed in CONTROLS) participate in the
+# data_hash, mirroring the OPTIMIZER_PARAMS pattern: editing kwargs for
+# an inactive source does NOT invalidate the snapshot cache.
+CONTROLS = ("lr", "batch_pca")
 
-    Default: scalar learning rate. Replace with anything callable that
-    returns a list / 1-D iterable of floats - DMDc will learn one column
-    of B per control dimension.
-
-    Called every step (not only on snapshot steps) so the recorder stores
-    the full per-step control sequence U.
-    """
-    return [optimizer.param_groups[0]["lr"]]
+CONTROL_PARAMS: dict[str, dict] = {
+    "lr":        {},
+    "batch_pca": {"k": 8},
+}
 
 
 # ---------------------------------------------------------------------------
