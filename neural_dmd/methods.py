@@ -17,7 +17,7 @@ The orchestrator (scripts/run_exp.py) and the unified analyze runner
 
 from __future__ import annotations
 
-from . import dmdc, sdmdc, optdmdc, coptdmdc
+from . import dmdc, sdmdc, optdmdc, coptdmdc, optdmdc_direct, coptdmdc_direct
 
 
 METHODS: dict[str, dict] = {
@@ -35,18 +35,35 @@ METHODS: dict[str, dict] = {
                    "eigenvalues. No LM.",
     },
     "optdmdc": {
-        "label":   "OptDMDc",
+        "label":   "OptDMDc (log)",
         "run":     optdmdc.run,
         "has_lm":  True,
         "blurb":   "Askham-Kutz Optimized DMD with control. Variable "
-                   "projection LM, no stability constraint.",
+                   "projection LM in continuous-time γ = log(λ)/dt. "
+                   "Fragile when warm-start has tiny |λ|.",
     },
     "coptdmdc": {
-        "label":   "cOptDMDc",
+        "label":   "cOptDMDc (log)",
         "run":     coptdmdc.run,
         "has_lm":  True,
-        "blurb":   "Constrained OptDMDc. Re(γ) ≤ 0 enforced via initial "
-                   "radial projection + linear-inequality LM step.",
+        "blurb":   "Constrained OptDMDc (log form). Re(γ) ≤ 0 enforced via "
+                   "initial radial projection + linear-inequality LM step.",
+    },
+    "optdmdc_direct": {
+        "label":   "OptDMDc (direct λ)",
+        "run":     optdmdc_direct.run,
+        "has_lm":  True,
+        "blurb":   "Direct-λ OptDMDc. Same VarPro LM, parametrized by the "
+                   "discrete-time eigenvalue. Forward-recurrence basis - "
+                   "no log/exp, no tiny-|λ| overflow.",
+    },
+    "coptdmdc_direct": {
+        "label":   "cOptDMDc (direct λ)",
+        "run":     coptdmdc_direct.run,
+        "has_lm":  True,
+        "blurb":   "Constrained direct-λ OptDMDc. Stability enforced by "
+                   "radial projection onto the unit disk after each LM "
+                   "step (non-linear constraint, projection-based).",
     },
 }
 

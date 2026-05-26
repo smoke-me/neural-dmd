@@ -56,7 +56,7 @@ EXP_DESCRIPTION = (
 
 # Which methods to run for this experiment. Order is preserved in
 # summary.md tables. Entries must exist in neural_dmd.methods.METHODS.
-METHODS = ("dmdc", "sdmdc", "optdmdc", "coptdmdc")
+METHODS = ("dmdc", "sdmdc", "optdmdc_direct", "coptdmdc_direct")
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +252,30 @@ METHOD_PARAMS: dict[str, dict] = {
                  "decr":     2.0,
                  "nu0":      2.0,
                  "dt":       float(SNAP_FIT_EVERY)},
+    # Direct-λ variants take the same kwargs (dt is accepted for API
+    # symmetry but unused; λ already absorbs dt).
+    "optdmdc_direct":  {"rank":     50,
+                        "pod_rank": None,
+                        "max_iter": 50,
+                        "tol":      1e-6,
+                        "tol_rel":  0,
+                        "patience": 0,
+                        "gmax":     50,
+                        "incr":     1.5,
+                        "decr":     2.0,
+                        "nu0":      2.0,
+                        "dt":       float(SNAP_FIT_EVERY)},
+    "coptdmdc_direct": {"rank":     50,
+                        "pod_rank": None,
+                        "max_iter": 50,
+                        "tol":      1e-6,
+                        "tol_rel":  0,
+                        "patience": 0,
+                        "gmax":     50,
+                        "incr":     1.5,
+                        "decr":     2.0,
+                        "nu0":      2.0,
+                        "dt":       float(SNAP_FIT_EVERY)},
 }
 
 

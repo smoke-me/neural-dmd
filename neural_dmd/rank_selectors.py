@@ -48,7 +48,7 @@ from .gavish_donoho import optimal_threshold
 from .log import banner, log, log_spectrum
 
 
-_LM_METHODS = ("optdmdc", "coptdmdc")
+_LM_METHODS = ("optdmdc", "coptdmdc", "optdmdc_direct", "coptdmdc_direct")
 
 
 def _patch_method_rank(method: str, rank: int) -> None:

@@ -694,7 +694,8 @@ def run_full_pipeline(methods: list[str] | tuple[str, ...] | None = None,
     # config.RANK_SELECTOR (see neural_dmd.rank_selectors). Skipped when
     # neither LM-based method appears in `methods` (saves the cost when
     # running only DMDc / sDMDc).
-    if any(m in methods for m in ("optdmdc", "coptdmdc")) \
+    if any(m in methods for m in
+           ("optdmdc", "coptdmdc", "optdmdc_direct", "coptdmdc_direct")) \
             and "analyze" in per_method_ops:
         try:
             from .rank_selectors import apply as _apply_rank_selector
