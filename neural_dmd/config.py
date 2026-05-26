@@ -50,9 +50,9 @@ PLOTS_ROOT = OUTPUT_ROOT / "plots"
 
 # Used to name the experiment directory:
 #   outputs/experiments/<YYYY-MM-DD_HH-MM-SS>_<EXP_LABEL>/
-EXP_LABEL       = "baseline"
+EXP_LABEL       = "Useful fit"
 EXP_DESCRIPTION = (
-    "Fit on first 50% of the data, predict the next 50%.")
+    "Fit on 350 steps and predict the rest!")
 
 # Which methods to run for this experiment. Order is preserved in
 # summary.md tables. Entries must exist in neural_dmd.methods.METHODS.
@@ -79,6 +79,27 @@ LOSS   = "cross_entropy"      # name in metrics.LOSSES used for training + plot_
 METRIC = "accuracy"           # name in metrics.METRICS used by test.py
 SEED   = 0                    # torch + numpy seed; participates in data_hash
 
+# Optimizer selection. Name looked up in neural_dmd.optimizers.OPTIMIZERS.
+# Per-optimizer kwargs live in OPTIMIZER_PARAMS[<name>]; missing entries
+# fall back to the builder's defaults. Both knobs participate in the
+# data_hash, so switching optimizer (or its params) invalidates the
+# snapshot cache.
+#
+#   OPTIMIZER = "adam"   torch.optim.Adam (default)
+#   OPTIMIZER = "sgd"    torch.optim.SGD  (plain SGD; set momentum > 0
+#                                          via OPTIMIZER_PARAMS for SGDM)
+OPTIMIZER = "adam"
+
+OPTIMIZER_PARAMS: dict[str, dict] = {
+    "adam": {"betas":        (0.9, 0.999),
+             "eps":          1e-8,
+             "weight_decay": 0.0},
+    "sgd":  {"momentum":     0.0,
+             "dampening":    0.0,
+             "weight_decay": 0.0,
+             "nesterov":     False},
+}
+
 
 def control_fn(optimizer, step):
     """Return the control vector u_k recorded with each gradient step.
@@ -96,21 +117,31 @@ def control_fn(optimizer, step):
 # ---------------------------------------------------------------------------
 # SNAPSHOT RECORDER + FIT WINDOW
 #
-# FIT_RANGE = (start, end)   dense snapshots in [start, end)
-#                            sparse elsewhere  (= forecast cadence)
-# FIT_RANGE = None           use FIT_FRAC: fit on [0, FIT_FRAC * total_steps)
+# Pick ONE of the two knobs below; the other MUST be None. Setting both
+# (or neither) raises a config error at startup - the previous
+# "FIT_RANGE silently wins" behaviour was easy to misread.
 #
-# FIT_RANGE wins if both are set. SNAP_FIT_EVERY governs cadence inside
-# the fit window; SNAP_FORECAST_EVERY governs cadence outside (both
-# pre-fit and post-fit). Both are training-relevant: changing them
-# invalidates the data_hash and forces a fresh training run.
+#   FIT_FRAC                  fraction-based fit window
+#     = 0.5                   -> fit on [0, 50%) of training
+#     = (0.2, 0.8)            -> fit on [20%, 80%) of training
+#
+#   FIT_RANGE                 step-based fit window
+#     = (start_step, end_step) -> fit on [start_step, end_step)
+#                                must satisfy 0 <= start < end <= total_steps
+#
+# SNAP_FIT_EVERY governs the dense snapshot cadence INSIDE the fit
+# window; SNAP_FORECAST_EVERY governs the sparse cadence outside (both
+# pre-fit and post-fit regions). Every knob in this block participates
+# in the data_hash: changing any value invalidates the snapshot cache
+# and forces a fresh training run.
 # ---------------------------------------------------------------------------
 
 SNAP_FIT_EVERY      = 1
 SNAP_FORECAST_EVERY = 50
 
-FIT_FRAC  = 0.5
-FIT_RANGE = None
+# Exactly one of these two MUST be non-None; the other MUST be None.
+FIT_FRAC  = None        # fraction-based: float OR (start_frac, end_frac)
+FIT_RANGE = (150, 500)    # step-based:    (start_step, end_step) or None
 
 # Inject zero-mean Gaussian noise into every recorded parameter
 # snapshot, simulating a noisy "measurement" of the underlying clean
@@ -129,6 +160,20 @@ FIT_RANGE = None
 # To turn noise OFF: set NOISE_SIGMA = 0.0 (or any value <= 0). The
 # inject_snapshot_noise call becomes a no-op.
 NOISE_SIGMA = 0.0
+
+# Per-checkpoint normalization. Name in neural_dmd.normalizers.NORMALIZERS.
+# Removes whole-trajectory drift in weight MAGNITUDE so DMD models only
+# the shape of the parameter tensors over time, not their overall size.
+# Participates in the data_hash (changes invalidate the snapshot cache).
+#
+#   "off"         No rescaling (default; flatten_params verbatim).
+#   "per_tensor"  Each parameter tensor (every weight matrix, every bias)
+#                 divided by its own L2 norm at record time. Every
+#                 component lives on the unit sphere. Eval-time loading
+#                 of these snapshots evaluates the *normalized* network
+#                 (matches the DMD forecast), so train-loss / test-loss
+#                 plots compare apples-to-apples in normalized space.
+SNAPSHOT_NORM = "per_tensor"
 
 # ---------------------------------------------------------------------------
 # METHOD PARAMS
@@ -183,23 +228,43 @@ METHOD_PARAMS: dict[str, dict] = {
 
 
 # ---------------------------------------------------------------------------
-# AUTO RANK SCAN (for OptDMDc / cOptDMDc)
+# RANK SELECTOR (for OptDMDc / cOptDMDc)
 #
-# When LM_RANK_AUTO is True, run_full_pipeline runs a quick held-out
-# forecast scan over LM_RANK_AUTO_CANDIDATES before invoking opt/copt.
-# The chosen rank is written into METHOD_PARAMS["optdmdc"|"coptdmdc"]
-# in place, so both LM methods agree on the same rank.
+# Strategy name looked up in neural_dmd.rank_selectors.RANK_SELECTORS.
+# The selected strategy runs once before the per-method analyses and
+# patches METHOD_PARAMS["optdmdc"|"coptdmdc"]["rank"] in place so both
+# LM methods agree on the same rank.
 #
-# Cost: thanks to the kernel's SVD cache, the first candidate pays the
-# full O(n*m^2) factorisation; subsequent candidates only rebuild the
-# small reduced operator F + run a forecast loop. A 6-candidate scan
-# typically adds 1-3 minutes to the pipeline at our default scale.
+#   "fixed"          No-op. Keep METHOD_PARAMS ranks as user-configured.
+#                    Use when you want to drive each method by hand.
 #
-# To turn the scan OFF: LM_RANK_AUTO = False (default). The static
-# METHOD_PARAMS["optdmdc"]["rank"] / ["coptdmdc"]["rank"] are used.
+#   "scan"           Held-out forecast-error scan over LM_RANK_AUTO_CANDIDATES
+#                    (the historical LM_RANK_AUTO path). Picks the rank
+#                    with lowest val L2 forecast error. Cost: 1-3 min at
+#                    our default scale (uses the kernel's SVD cache).
+#
+#   "gavish_donoho"  Optimal hard SVD threshold (Gavish & Donoho 2014).
+#                    Pure statistical pick from the X_fit spectrum - no
+#                    forecast loop. Orders of magnitude cheaper than
+#                    "scan". Honors GD_USE_KNOWN_SIGMA below.
+#
+# LM_RANK_AUTO is the legacy boolean; ignored when RANK_SELECTOR is set
+# to anything other than "fixed". Kept here so the "scan" selector reads
+# the same candidate list / patience / val_frac as before.
 # ---------------------------------------------------------------------------
 
-LM_RANK_AUTO            = True
+RANK_SELECTOR = "gavish_donoho"
+
+# Gavish-Donoho options (consulted only when RANK_SELECTOR = "gavish_donoho").
+#   GD_USE_KNOWN_SIGMA = False  -> median-based estimator (recommended;
+#                                  needs no extra information beyond the
+#                                  observed singular spectrum).
+#   GD_USE_KNOWN_SIGMA = True   -> use NOISE_SIGMA above as the absolute
+#                                  noise level (scaled by trajectory std,
+#                                  matching how the recorder injected it).
+GD_USE_KNOWN_SIGMA = False
+
+LM_RANK_AUTO            = True   # legacy flag, see note above
 LM_RANK_AUTO_CANDIDATES = (1, 5, 10, 14, 15, 16, 17, 18, 19, 20, 21, 23, 25, 50, 100, 200, 400)
 LM_RANK_AUTO_PATIENCE   = 2          # consecutive non-improving ranks before stop
 LM_RANK_AUTO_VAL_FRAC   = 0.1        # last 10% of fit window held out for validation

@@ -40,6 +40,7 @@ from neural_dmd.data import get_loaders
 from neural_dmd.log import banner, log, progress
 from neural_dmd.metrics import LOSSES
 from neural_dmd.model import MLP
+from neural_dmd.optimizers import build as build_optimizer
 from neural_dmd.schedule import cosine, current_lr
 from neural_dmd.snapshots import Recorder, inject_snapshot_noise
 
@@ -76,22 +77,10 @@ def train_epoch(model, loader, opt, sched, recorder, loss_fn, *,
     return total_loss / total, correct / total
 
 
-def _resolve_fit_window(total_steps: int) -> tuple[int, int]:
-    """Compute (fit_start_step, fit_end_step) from config.
-
-    FIT_RANGE wins if set (must be a 2-tuple of ints satisfying
-    0 <= start < end <= total_steps). Else fall back to FIT_FRAC.
-    Both values are participants in the data_hash, so changing them
-    invalidates the training cache and forces a retrain."""
-    fr = getattr(C, "FIT_RANGE", None)
-    if fr is not None:
-        start, end = int(fr[0]), int(fr[1])
-        if not (0 <= start < end <= total_steps):
-            raise ValueError(
-                f"FIT_RANGE={fr} invalid for total_steps={total_steps}")
-        return start, end
-    end = max(2, int(C.FIT_FRAC * total_steps))
-    return 0, end
+# Fit-window resolution lives in neural_dmd.experiments so the training
+# script + the data_hash + summary.html all see the same numbers. See
+# experiments.resolve_fit_window() for the validation rules.
+_resolve_fit_window = E.resolve_fit_window
 
 
 def main():
@@ -153,6 +142,8 @@ def main():
     banner("training start",
            dataset=C.DATASET, arch=C.ARCH, device=device,
            epochs=C.EPOCHS, batch=C.BATCH_SIZE, lr=C.LR, loss=C.LOSS,
+           optimizer=getattr(C, "OPTIMIZER", "adam"),
+           snapshot_norm=getattr(C, "SNAPSHOT_NORM", "off"),
            seed=seed, data_hash=dh)
 
     train_loader, _ = get_loaders(C.DATASET, C.BATCH_SIZE, C.EVAL_BATCH, C.DATA_ROOT,
@@ -174,10 +165,12 @@ def main():
         f"~{n_pre_snaps} pre-fit + ~{n_post_snaps} post-fit snaps")
 
     # ----- build model + optimiser + scheduler -----
-    model   = MLP(C.ARCH).to(device)
-    opt     = torch.optim.Adam(model.parameters(), lr=C.LR)
-    sched   = cosine(opt, total_steps, min_lr=C.LR_MIN)
-    loss_fn = LOSSES[C.LOSS]
+    model    = MLP(C.ARCH).to(device)
+    opt_name = getattr(C, "OPTIMIZER", "adam")
+    opt_kw   = getattr(C, "OPTIMIZER_PARAMS", {}).get(opt_name, {})
+    opt      = build_optimizer(opt_name, model.parameters(), C.LR, opt_kw)
+    sched    = cosine(opt, total_steps, min_lr=C.LR_MIN)
+    loss_fn  = LOSSES[C.LOSS]
 
     recorder = Recorder(
         fit_every=C.SNAP_FIT_EVERY,
@@ -186,6 +179,7 @@ def main():
         fit_end_step=fit_end_step,
         total_steps=total_steps,
         control_fn=C.control_fn,
+        normalizer=getattr(C, "SNAPSHOT_NORM", "off"),
     )
 
     # ----- train -----

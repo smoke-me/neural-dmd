@@ -35,6 +35,7 @@ for every step in the forecast region too.
 import numpy as np
 
 from .log import log
+from .normalizers import get as _get_normalizer
 from .params import flatten_params
 
 
@@ -83,7 +84,8 @@ def inject_snapshot_noise(X_list: list[np.ndarray],
 class Recorder:
     def __init__(self, *, fit_every: int, forecast_every: int,
                  fit_start_step: int, fit_end_step: int,
-                 total_steps: int, control_fn):
+                 total_steps: int, control_fn,
+                 normalizer: str = "off"):
         # fit_every       : record every N steps inside [fit_start_step, fit_end_step)
         # forecast_every  : record every N steps outside that window
         # fit_start_step  : gradient-step boundary; first fit-region step
@@ -91,6 +93,10 @@ class Recorder:
         # total_steps     : total training steps; controls list will have
         #                   length total_steps - 1
         # control_fn      : (optimizer, step) -> 1-D iterable of floats
+        # normalizer      : name in neural_dmd.normalizers.NORMALIZERS used
+        #                   to rescale each parameter snapshot before storing.
+        #                   "off" reproduces the historical (flatten_params)
+        #                   behaviour byte-for-byte.
         if not (0 <= fit_start_step < fit_end_step <= total_steps):
             raise ValueError(
                 f"invalid fit window: fit_start_step={fit_start_step}  "
@@ -101,6 +107,8 @@ class Recorder:
         self.fit_end_step    = fit_end_step
         self.total_steps     = total_steps
         self.control_fn      = control_fn
+        self.normalizer_name = str(normalizer)
+        self._normalize      = _get_normalizer(self.normalizer_name)
 
         self.X: list[np.ndarray] = []
         self.U: list[list[float]] = []
@@ -121,7 +129,7 @@ class Recorder:
         # always records the control vector u_k (so U is dense across the run).
         k = self._k
         if self._is_snapshot_step(k):
-            self.X.append(flatten_params(model))
+            self.X.append(self._normalize(model))
             self.steps.append(k)
         self.U.append(list(self.control_fn(optimizer, k)))
         self._k += 1
@@ -130,7 +138,9 @@ class Recorder:
     def load(path: str) -> dict:
         # Inverse of save(). Returns a dict with all arrays + scalar
         # metadata. Backwards-compat: schemas written before FIT_RANGE
-        # was added (no fit_start_step / fit_start_idx) default to 0.
+        # was added (no fit_start_step / fit_start_idx) default to 0;
+        # schemas written before SNAPSHOT_NORM default normalizer to
+        # "off".
         npz = np.load(path)
         keys = set(npz.files)
         out = {
@@ -144,6 +154,7 @@ class Recorder:
             "forecast_every": int(npz["forecast_every"]),
             "fit_start_step": int(npz["fit_start_step"]) if "fit_start_step" in keys else 0,
             "fit_start_idx":  int(npz["fit_start_idx"])  if "fit_start_idx"  in keys else 0,
+            "normalizer":     (str(npz["normalizer"]) if "normalizer" in keys else "off"),
         }
         return out
 
@@ -171,4 +182,5 @@ class Recorder:
             total_steps=np.int64(self.total_steps),
             fit_every=np.int64(self.fit_every),
             forecast_every=np.int64(self.forecast_every),
+            normalizer=np.array(self.normalizer_name),
         )

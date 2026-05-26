@@ -624,18 +624,29 @@ def run_full_pipeline(methods: list[str] | tuple[str, ...] | None = None,
 
     _log_memory_estimate(methods)
 
-    # Auto rank-selection for OptDMDc / cOptDMDc. Runs a quick held-out
-    # forecast scan over candidate ranks and patches METHOD_PARAMS in
-    # place. Skipped when LM_RANK_AUTO is False or when neither LM-based
-    # method appears in `methods` (saving the scan cost when running
-    # only DMDc / sDMDc).
+    # Auto rank-selection for OptDMDc / cOptDMDc. Dispatches on
+    # config.RANK_SELECTOR (see neural_dmd.rank_selectors). Skipped when
+    # neither LM-based method appears in `methods` (saves the cost when
+    # running only DMDc / sDMDc).
     if any(m in methods for m in ("optdmdc", "coptdmdc")) \
             and "analyze" in per_method_ops:
         try:
-            from .rank_scan import auto_select_lm_rank
-            auto_select_lm_rank()
+            from .rank_selectors import apply as _apply_rank_selector
+            from .snapshots import Recorder
+            from . import experiments as _E
+            snap_path = _E.snapshots_path()
+            if snap_path.exists():
+                snap = Recorder.load(snap_path)
+                selector_name = getattr(C, "RANK_SELECTOR", "fixed")
+                log("info",
+                    f"runners: applying rank selector '{selector_name}'")
+                _apply_rank_selector(snap)
+            else:
+                log("warn",
+                    f"runners: snapshots not found at {snap_path}; "
+                    "skipping rank selector")
         except Exception as e:
-            log("warn", f"runners: rank scan failed ({e}); falling back to "
+            log("warn", f"runners: rank selector failed ({e}); falling back to "
                         "configured METHOD_PARAMS rank")
 
     try:

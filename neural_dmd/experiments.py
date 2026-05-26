@@ -100,12 +100,15 @@ TRAIN_FIELDS = (
     "LR",
     "LR_MIN",
     "LOSS",
+    "OPTIMIZER",
+    "OPTIMIZER_PARAMS",
     "FIT_FRAC",
     "FIT_RANGE",
     "SNAP_FIT_EVERY",
     "SNAP_FORECAST_EVERY",
     "SEED",
     "NOISE_SIGMA",
+    "SNAPSHOT_NORM",
 )
 
 _EXP_ID_ENV = "NEURAL_DMD_EXP_ID"
@@ -115,31 +118,123 @@ _EXP_ID_ENV = "NEURAL_DMD_EXP_ID"
 # data hash + paths
 # ---------------------------------------------------------------------------
 
+def resolve_fit_window(total_steps: int) -> tuple[int, int]:
+    """Return (fit_start_step, fit_end_step) from config.
+
+    Exactly ONE of <code>FIT_FRAC</code> / <code>FIT_RANGE</code> must
+    be set (the other must be <code>None</code>). Setting both, or
+    setting neither, is a configuration error and raises ValueError -
+    the previous "FIT_RANGE wins silently" behaviour was easy to misread.
+
+    Accepted forms:
+
+      FIT_FRAC = f               float in (0, 1]
+                                 -> [0, round(f * total_steps))
+      FIT_FRAC = (a, b)          floats in [0, 1], a < b
+                                 -> [round(a*N), round(b*N))
+      FIT_RANGE = (start, end)   ints in [0, total_steps], start < end
+                                 -> [start, end)
+
+    Both windows must contain >= 2 snapshots (the DMDc fit needs at
+    least one pair); we round end up to satisfy that.
+    """
+    fr = getattr(C, "FIT_RANGE", None)
+    ff = getattr(C, "FIT_FRAC",  None)
+
+    if fr is not None and ff is not None:
+        raise ValueError(
+            "config error: exactly one of FIT_FRAC / FIT_RANGE may be set "
+            f"(both are: FIT_FRAC={ff!r}, FIT_RANGE={fr!r}). Set the "
+            "inactive one to None.")
+    if fr is None and ff is None:
+        raise ValueError(
+            "config error: one of FIT_FRAC or FIT_RANGE must be set; both "
+            "are None. Use FIT_FRAC (fraction-based) or FIT_RANGE "
+            "(step-based) to define the fit window.")
+
+    if fr is not None:
+        if not (isinstance(fr, (tuple, list)) and len(fr) == 2):
+            raise ValueError(
+                f"FIT_RANGE must be a (start, end) pair; got {fr!r}")
+        start, end = int(fr[0]), int(fr[1])
+        if not (0 <= start < end <= total_steps):
+            raise ValueError(
+                f"FIT_RANGE={fr} invalid for total_steps={total_steps}; "
+                f"need 0 <= start < end <= {total_steps}")
+        return start, end
+
+    # FIT_FRAC branch
+    if isinstance(ff, (tuple, list)):
+        if len(ff) != 2:
+            raise ValueError(
+                f"FIT_FRAC tuple must be (start_frac, end_frac); got {ff!r}")
+        a, b = float(ff[0]), float(ff[1])
+    else:
+        a, b = 0.0, float(ff)
+    if not (0.0 <= a < b <= 1.0):
+        raise ValueError(
+            f"FIT_FRAC={ff!r} invalid; need 0 <= start_frac < end_frac <= 1 "
+            "(or a single float in (0, 1]).")
+    start = int(round(a * total_steps))
+    end   = int(round(b * total_steps))
+    end   = max(end, start + 2)
+    end   = min(end, total_steps)
+    if not (start < end):
+        raise ValueError(
+            f"FIT_FRAC={ff!r} on total_steps={total_steps} yields empty "
+            f"window [{start}, {end})")
+    return start, end
+
+
 def train_config_dict() -> dict:
     """Subset of config used to derive the data_hash.
 
     Special handling for the fit-window selector:
-        FIT_RANGE wins at runtime when it is not None (FIT_FRAC is
-        ignored). To match that semantics, we hash ONLY the active
-        selector - so toggling FIT_FRAC while FIT_RANGE is set, or
-        toggling FIT_RANGE while it stays None, does NOT invalidate
-        the cache. Whichever value would actually drive the recorder
-        is the only one that participates in the hash.
+        Only the ACTIVE knob (FIT_RANGE or FIT_FRAC, whichever is not
+        None) participates in the hash. Toggling the inactive one or
+        setting it to None doesn't invalidate the cache.
+
+        Mutual exclusivity is enforced lazily here too: if both are set
+        or both are None we surface the same ValueError as the runtime
+        resolver, so the failure happens before we mint a phantom hash.
     """
     fields: dict[str, Any] = {}
     for k in TRAIN_FIELDS:
-        if k in ("FIT_FRAC", "FIT_RANGE"):
-            continue   # handled below as the active selector
+        if k in ("FIT_FRAC", "FIT_RANGE", "OPTIMIZER_PARAMS"):
+            continue   # handled below
         v = getattr(C, k, None)
         if isinstance(v, list):
             v = tuple(v)
         fields[k] = v
 
+    # OPTIMIZER_PARAMS: only the entry for the active OPTIMIZER goes
+    # into the hash, so toggling kwargs for an unused optimizer does
+    # NOT invalidate the cache. Mirrors the FIT_FRAC/FIT_RANGE pattern.
+    opt_name = getattr(C, "OPTIMIZER", "adam")
+    opt_all  = getattr(C, "OPTIMIZER_PARAMS", {}) or {}
+    opt_kw   = opt_all.get(opt_name, {}) or {}
+    fields["OPTIMIZER_PARAMS"] = {
+        k: (tuple(v) if isinstance(v, list) else v)
+        for k, v in sorted(opt_kw.items())
+    }
+
     fr = getattr(C, "FIT_RANGE", None)
+    ff = getattr(C, "FIT_FRAC",  None)
+    if fr is not None and ff is not None:
+        raise ValueError(
+            "config error: exactly one of FIT_FRAC / FIT_RANGE may be set "
+            f"(both are: FIT_FRAC={ff!r}, FIT_RANGE={fr!r}). Set the "
+            "inactive one to None.")
+    if fr is None and ff is None:
+        raise ValueError(
+            "config error: one of FIT_FRAC or FIT_RANGE must be set; both "
+            "are None.")
     if fr is not None:
         fields["FIT_RANGE"] = tuple(fr) if isinstance(fr, (list, tuple)) else fr
     else:
-        fields["FIT_FRAC"] = float(getattr(C, "FIT_FRAC", 0.5))
+        fields["FIT_FRAC"] = (tuple(float(x) for x in ff)
+                              if isinstance(ff, (list, tuple))
+                              else float(ff))
 
     fields["control_fn:source"] = inspect.getsource(C.control_fn)
     return fields
@@ -1045,12 +1140,39 @@ def write_summary() -> None:
     noise = float(getattr(C, "NOISE_SIGMA", 0.0) or 0.0)
     fit_range = getattr(C, "FIT_RANGE", None)
     fit_frac  = getattr(C, "FIT_FRAC", None)
-    if fit_range is not None:
-        fit_window_str = (f"FIT_RANGE = ({int(fit_range[0])}, "
-                          f"{int(fit_range[1])})")
+    # Source-of-truth description: which knob is active + the raw value.
+    # The resolved (start_step, end_step) is recovered from the snapshot
+    # cache below so the report shows both the knob the user set and
+    # the actual window it produced.
+    if fit_range is not None and fit_frac is None:
+        fit_knob_str = f"FIT_RANGE = ({int(fit_range[0])}, {int(fit_range[1])})"
+    elif fit_frac is not None and fit_range is None:
+        if isinstance(fit_frac, (list, tuple)):
+            a, b = float(fit_frac[0]), float(fit_frac[1])
+            fit_knob_str = f"FIT_FRAC = ({a:.3f}, {b:.3f})"
+        else:
+            fit_knob_str = f"FIT_FRAC = {float(fit_frac):.3f}  (start = 0.0)"
     else:
-        fit_window_str = (f"FIT_FRAC = {fit_frac:.3f}"
-                          if fit_frac is not None else "—")
+        fit_knob_str = (f"⚠ both FIT_FRAC and FIT_RANGE set "
+                        f"({fit_frac!r}, {fit_range!r})  "
+                        if fit_range is not None and fit_frac is not None
+                        else "⚠ neither FIT_FRAC nor FIT_RANGE set")
+
+    # Resolved [start, end) in absolute step numbers, pulled from the
+    # snapshot cache so the report shows what the recorder actually saw.
+    try:
+        snap_meta = np.load(snapshots_path()) if snapshots_path().exists() else None
+        if snap_meta is not None:
+            fs = int(snap_meta["fit_start_step"]) if "fit_start_step" in snap_meta.files else 0
+            fe = int(snap_meta["fit_steps"])
+            tot = int(snap_meta["total_steps"])
+            pct = 100.0 * (fe - fs) / max(tot, 1)
+            fit_resolved_str = (f"resolved: steps [{fs}, {fe})  "
+                                f"of {tot} total  ({pct:.1f}% of training)")
+        else:
+            fit_resolved_str = ""
+    except Exception:
+        fit_resolved_str = ""
 
     if noise > 0:
         noise_html = (f"<code>NOISE_SIGMA = {noise:.3e}</code> "
@@ -1064,7 +1186,10 @@ def write_summary() -> None:
     out.append(f"<dt>Dataset</dt><dd><code>{h(str(getattr(C, 'DATASET', '—')).upper())}</code></dd>")
     out.append(f"<dt>Data cache</dt><dd><code>outputs/data/{h(dh)}/</code></dd>")
     out.append(f"<dt>Epochs</dt><dd><code>{h(str(getattr(C, 'EPOCHS', '—')))}</code></dd>")
-    out.append(f"<dt>Fit window</dt><dd><code>{h(fit_window_str)}</code></dd>")
+    fit_dd = f"<code>{h(fit_knob_str)}</code>"
+    if fit_resolved_str:
+        fit_dd += f"<br><span class='note'>{h(fit_resolved_str)}</span>"
+    out.append(f"<dt>Fit window</dt><dd>{fit_dd}</dd>")
     out.append(f"<dt>Snapshot noise</dt><dd>{noise_html}</dd>")
     out.append(f"<dt>Precision / repro tier</dt>"
                f"<dd><code>{h(str(getattr(C, 'PRECISION', 'float64')))}</code>"
